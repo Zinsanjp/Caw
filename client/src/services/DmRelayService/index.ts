@@ -41,6 +41,7 @@ import type { RelayEnvelope } from '../../api/routes/dm-relay'
 import { canonicalizeEnvelope } from '../../api/routes/dm-relay'
 import crypto from 'crypto'
 import { getNetworkId } from '../../utils/networkId'
+import { peerCircuitBreaker } from '../PeerCircuitBreaker'
 
 // Outbound relay fetches previously had no timeout: a hung/unreachable
 // peer would leave the request pending indefinitely, leaking a socket
@@ -209,6 +210,13 @@ export async function relayDmToPeers(params: RelayParams): Promise<{ attempted: 
   const peers = getPeers(networkId).filter(p => p.active && p.instanceId !== sourceInstanceId)
   if (peers.length === 0) return { attempted: 0 }
 
+  // Piggyback the circuit breaker's cleanup on this call rather than a
+  // separate timer -- relayDmToPeers already runs on every outbound DM,
+  // frequent enough to keep the tracked-peer Map from accumulating state
+  // for instances that are no longer active (deactivated, or pruned from
+  // a prior stale-registration cleanup).
+  peerCircuitBreaker.prune(peers.map(p => p.instanceId))
+
   const envelope: RelayEnvelope = {
     encryptedPayload: params.encryptedPayload,
     senderId: params.senderId,
@@ -237,7 +245,14 @@ export async function relayDmToPeers(params: RelayParams): Promise<{ attempted: 
     senderSig: params.senderSig ?? null,
   })
 
+  let attempted = 0
   for (const peer of peers) {
+    if (!peerCircuitBreaker.shouldAllowRequest(peer.instanceId)) {
+      if (process.env.DM_RELAY_VERBOSE === '1') {
+        console.warn(`[DmRelay] Circuit open for peer ${peer.instanceId} (${peer.apiUrl}) — skipping`)
+      }
+      continue
+    }
     let peerUrl: string
     try {
       peerUrl = buildPeerUrl(peer.apiUrl, '/api/dm/relay')
@@ -245,22 +260,35 @@ export async function relayDmToPeers(params: RelayParams): Promise<{ attempted: 
       console.warn(`[DmRelay] Skipping peer ${peer.instanceId} — invalid apiUrl: ${urlErr.message}`)
       continue
     }
+    attempted++
     fetch(peerUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
       signal: AbortSignal.timeout(DM_RELAY_TIMEOUT_MS),
+    }).then(res => {
+      // 2xx/4xx both mean the peer is up and answered over HTTP — a 4xx
+      // is a protocol/business rejection, not evidence of an unreachable
+      // peer. 429 is the one 4xx we still treat as failure: it means the
+      // peer is overloaded, and hammering it again next send would make
+      // that worse rather than better.
+      if (res.status === 429 || res.status >= 500) {
+        peerCircuitBreaker.recordFailure(peer.instanceId)
+      } else {
+        peerCircuitBreaker.recordSuccess(peer.instanceId)
+      }
     }).catch(err => {
       // Fire-and-forget. Network errors are routine (peer down,
       // unreachable), and so is the abort from the timeout above.
       // Don't spam the log on every failure.
+      peerCircuitBreaker.recordFailure(peer.instanceId)
       if (process.env.DM_RELAY_VERBOSE === '1') {
         console.warn(`[DmRelay] Failed to relay to ${peer.apiUrl}:`, err.message)
       }
     })
   }
 
-  return { attempted: peers.length }
+  return { attempted }
 }
 
 /**
@@ -342,6 +370,12 @@ export async function relayDmIdentityToPeers(params: {
   const body = JSON.stringify({ ...envelope, signature })
 
   for (const peer of peers) {
+    if (!peerCircuitBreaker.shouldAllowRequest(peer.instanceId)) {
+      if (process.env.DM_RELAY_VERBOSE === '1') {
+        console.warn(`[DmRelay] Circuit open for peer ${peer.instanceId} (${peer.apiUrl}) — skipping identity relay`)
+      }
+      continue
+    }
     let peerUrl: string
     try {
       peerUrl = buildPeerUrl(peer.apiUrl, '/api/dm/identity/relay')
@@ -354,9 +388,17 @@ export async function relayDmIdentityToPeers(params: {
       headers: { 'Content-Type': 'application/json' },
       body,
       signal: AbortSignal.timeout(DM_RELAY_TIMEOUT_MS),
+    }).then(res => {
+      // Same success/failure classification as relayDmToPeers above.
+      if (res.status === 429 || res.status >= 500) {
+        peerCircuitBreaker.recordFailure(peer.instanceId)
+      } else {
+        peerCircuitBreaker.recordSuccess(peer.instanceId)
+      }
     }).catch(err => {
       // Fire-and-forget, same as relayDmToPeers above — routine network
       // errors and timeout aborts are both expected here.
+      peerCircuitBreaker.recordFailure(peer.instanceId)
       if (process.env.DM_RELAY_VERBOSE === '1') {
         console.warn(`[DmRelay] Failed to relay identity to ${peer.apiUrl}:`, err.message)
       }
