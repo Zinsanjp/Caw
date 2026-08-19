@@ -12,6 +12,7 @@ import { CawNotFoundError } from '../ActionProcessor/actionHandlers'
 import type { RawAction } from '../ActionProcessor/types'
 import { refreshUserFromChain, reconcileUsernameDrift, StaleTokenError } from '../UserService'
 import { getNetworkId } from '../../utils/networkId'
+import { countManager } from '../CountManager'
 
 // Lazy-initialized L2 read provider for the pending-mint-deposit watcher.
 // Reused across ticks so we don't churn sockets.
@@ -462,6 +463,20 @@ async function cleanupPendingCaws() {
             await prisma.caw.update({
               where: { id: pendingCaw.id },
               data: { status: 'FAILED' }
+            })
+
+            // Roll back the optimistic user.cawCount/recawCount bump from
+            // creation -- same PENDING->FAILED rollback path
+            // txQueueFailure.ts uses for CAW/RECAW, and the same gap PR
+            // #58 closed for like/follow (DataCleaner's 30-minute-timeout
+            // path predates CountManager and was never migrated onto it).
+            // This only touches the sender's own cawCount/recawCount; the
+            // parent's recawCount recalculation below is pre-existing and
+            // left as-is.
+            await countManager.onStatusChanged(prisma, 'caw', pendingCaw.id, 'PENDING', 'FAILED', {
+              userId: pendingCaw.userId,
+              action: pendingCaw.action,
+              originalCawId: null,
             })
 
             // If this was a recaw, decrement the parent's recawCount
