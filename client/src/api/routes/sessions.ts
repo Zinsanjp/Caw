@@ -582,17 +582,41 @@ router.delete('/', async (req: any, res: any) => {
       return res.status(400).json({ error: 'Invalid signature shape' })
     }
 
-    const ip = (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim()
-      || req.socket?.remoteAddress
-      || 'unknown'
+    // req.ip honours the app-wide 'trust proxy' = loopback (server.ts), so a client
+    // cannot pick its own bucket by forging X-Forwarded-For.
+    const ip = req.ip || req.socket?.remoteAddress || 'unknown'
     if (!(await checkRevokeRateLimit('ip', ip, REVOKE_IP_LIMIT))) {
       return res.status(429).json({ error: 'Rate limit: too many revocation requests from this IP' })
     }
+
+    // Block concurrent submissions for the same owner (mirrors POST pattern)
+    if (inFlight.has(owner.toLowerCase())) {
+      return res.status(409).json({ error: 'A revocation is already in progress for this owner' })
+    }
+
+    // Verify the signature BEFORE charging the per-owner budget. Only the session
+    // key's holder can produce a signature that passes, so a stranger sending junk
+    // for someone else's address can no longer exhaust that owner's daily budget.
+    // The simulation also rejects a replay of an already-applied revocation
+    // (NoSession) and costs no gas. The per-IP budget above still bounds the RPC
+    // calls this makes.
+    try {
+      const sigParts = ethers.Signature.from(signature)
+      await getContract().revokeSessionBySig.staticCall(
+        owner, sessionKey, sigParts.v, sigParts.r, sigParts.s,
+      )
+    } catch (err: any) {
+      if (err?.code === 'CALL_EXCEPTION') {
+        return res.status(400).json({ error: 'Invalid signature or no active session' })
+      }
+      console.error('[Sessions] Revocation pre-check unavailable:', err?.message)
+      return res.status(503).json({ error: 'Signature verification temporarily unavailable. Please try again.' })
+    }
+
     if (!(await checkRevokeRateLimit('owner', owner.toLowerCase(), REVOKE_OWNER_LIMIT))) {
       return res.status(429).json({ error: 'Rate limit: too many revocation requests for this owner' })
     }
-
-    // Block concurrent submissions for the same owner (mirrors POST pattern)
+    // Re-check: the simulation above awaited, so another request may have won.
     if (inFlight.has(owner.toLowerCase())) {
       return res.status(409).json({ error: 'A revocation is already in progress for this owner' })
     }
