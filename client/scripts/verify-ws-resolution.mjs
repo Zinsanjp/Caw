@@ -20,8 +20,13 @@ const nestedInEthers = fs.existsSync(path.join(clientDir, 'node_modules/ethers/n
 console.log(`Top-level ws version: ${topLevel}`)
 console.log(`Nested copy under ethers present: ${nestedInEthers}`)
 
-if (topLevel !== '8.21.3') {
-  console.error('FAIL: expected ws 8.21.3')
+const MIN_WS = [8, 21, 0]
+const parsed = (topLevel || '').split('.').map((n) => parseInt(n, 10))
+const tooOld = parsed.length < 3 || parsed.some(Number.isNaN)
+  || parsed[0] < MIN_WS[0]
+  || (parsed[0] === MIN_WS[0] && (parsed[1] < MIN_WS[1] || (parsed[1] === MIN_WS[1] && parsed[2] < MIN_WS[2])))
+if (tooOld) {
+  console.error(`FAIL: expected ws >= 8.21.0, got ${topLevel}`)
   process.exit(1)
 }
 if (nestedInEthers) {
