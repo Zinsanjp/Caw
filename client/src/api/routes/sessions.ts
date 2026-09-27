@@ -489,6 +489,10 @@ router.get('/status/:requestId', async (req: any, res: any) => {
 const REVOKE_IP_LIMIT = 30        // per 24h
 const REVOKE_OWNER_LIMIT = 10     // per 24h
 const REVOKE_WINDOW = 24 * 60 * 60
+// The only reverts revokeSessionBySig produces: the request is bad (wrong signature,
+// or no live session). Anything else is not the caller's fault.
+const REVOKE_BAD_SIG = ethers.id('BadSig()').slice(0, 10)
+const REVOKE_NO_SESSION = ethers.id('NoSession()').slice(0, 10)
 
 async function checkRevokeRateLimit(scope: string, key: string, max: number): Promise<boolean> {
   const k = `revoke_ratelimit:${scope}:${key}`
@@ -600,13 +604,29 @@ router.delete('/', async (req: any, res: any) => {
     // The simulation also rejects a replay of an already-applied revocation
     // (NoSession) and costs no gas. The per-IP budget above still bounds the RPC
     // calls this makes.
+    // A well-formed but invalid signature value (for example a non-canonical s) is a
+    // bad request, not an outage. ethers v6 accepts such a value in Signature.from and
+    // only throws when `.s` is read, so read every component here, before the simulation.
+    let sigV: number
+    let sigR: string
+    let sigS: string
     try {
-      const sigParts = ethers.Signature.from(signature)
+      const sig = ethers.Signature.from(signature)
+      sigV = sig.v
+      sigR = sig.r
+      sigS = sig.s
+    } catch {
+      return res.status(400).json({ error: 'Invalid signature' })
+    }
+    try {
       await getContract().revokeSessionBySig.staticCall(
-        owner, sessionKey, sigParts.v, sigParts.r, sigParts.s,
+        owner, sessionKey, sigV, sigR, sigS,
       )
     } catch (err: any) {
-      if (err?.code === 'CALL_EXCEPTION') {
+      // ethers v6 also reports a revert with no data as CALL_EXCEPTION, so match the
+      // revert data instead of the error code alone.
+      const data = String(err?.data ?? '')
+      if (err?.code === 'CALL_EXCEPTION' && (data.startsWith(REVOKE_BAD_SIG) || data.startsWith(REVOKE_NO_SESSION))) {
         return res.status(400).json({ error: 'Invalid signature or no active session' })
       }
       console.error('[Sessions] Revocation pre-check unavailable:', err?.message)

@@ -5,6 +5,7 @@
  *
  * Uses a local JSON-RPC stub for eth_call so the real getContract() /
  * staticCall path runs, and Redis db 15 (REDIS_URL) so nothing else is touched.
+ * Run with mocha --exit: the router's imports keep Redis/DB connections open.
  */
 import { describe, it, before, after, beforeEach } from 'mocha'
 import { expect } from 'chai'
@@ -13,13 +14,14 @@ import request from 'supertest'
 import Redis from 'ioredis'
 import { Wallet, id } from 'ethers'
 
-type Mode = 'revert' | 'ok' | 'down'
+type Mode = 'revert' | 'ok' | 'down' | 'bare' | 'nosession'
 let mode: Mode = 'revert'
 let rpc: http.Server
 let app: any
 let redis: Redis
 
 const BAD_SIG = id('BadSig()').slice(0, 10)
+const NO_SESSION = id('NoSession()').slice(0, 10)
 const SIG = '0x' + '11'.repeat(64) + '1b'
 const rand = () => Wallet.createRandom().address
 let ipCounter = 0
@@ -32,7 +34,9 @@ function handle(body: any) {
   if (method === 'net_version') return { jsonrpc: '2.0', id: rid, result: '84532' }
   if (method === 'eth_call') {
     if (mode === 'ok') return { jsonrpc: '2.0', id: rid, result: '0x' }
-    return { jsonrpc: '2.0', id: rid, error: { code: 3, message: 'execution reverted', data: BAD_SIG } }
+    if (mode === 'bare') return { jsonrpc: '2.0', id: rid, error: { code: 3, message: 'execution reverted' } }
+    const data = mode === 'nosession' ? NO_SESSION : BAD_SIG
+    return { jsonrpc: '2.0', id: rid, error: { code: 3, message: 'execution reverted', data } }
   }
   return { jsonrpc: '2.0', id: rid, error: { code: -32601, message: 'stub: ' + method } }
 }
@@ -105,6 +109,31 @@ describe('DELETE /api/sessions rate limiting', function () {
 
   it('answers 503 and charges nothing when the RPC is unavailable', async () => {
     mode = 'down'
+    const owner = rand()
+    const res = await del(owner, freshIp())
+    expect(res.status).to.equal(503)
+    expect(await redis.llen(ownerKey(owner))).to.equal(0)
+  })
+
+  it('answers 400, not 503, for a well-formed signature whose value is not canonical', async () => {
+    const owner = rand()
+    const nonCanonicalS = '0x' + '11'.repeat(32) + '80' + '11'.repeat(31) + '1b'
+    const res = await request(app).delete('/api/sessions').set('X-Forwarded-For', freshIp())
+      .send({ owner, sessionKey: rand(), signature: nonCanonicalS })
+    expect(res.status).to.equal(400)
+    expect(await redis.llen(ownerKey(owner))).to.equal(0)
+  })
+
+  it('answers 400 for a NoSession revert (already revoked) and charges nothing', async () => {
+    mode = 'nosession'
+    const owner = rand()
+    const res = await del(owner, freshIp())
+    expect(res.status).to.equal(400)
+    expect(await redis.llen(ownerKey(owner))).to.equal(0)
+  })
+
+  it('answers 503, not 400, for a revert that carries no data', async () => {
+    mode = 'bare'
     const owner = rand()
     const res = await del(owner, freshIp())
     expect(res.status).to.equal(503)
