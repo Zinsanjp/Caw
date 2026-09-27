@@ -16,7 +16,7 @@ import { withWalletLock } from '../../utils/walletQueue'
 import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { decompressActionText } from '../../utils/decompressActionText'
-import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
+import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl, blocksForDuration } from '../../utils/rpcProvider'
 import { getIndexerStats } from '../../utils/indexerHealth'
 import type { AbstractProvider } from 'ethers'
 import { cawToEthCached, isPriceFresh } from '../ChainSyncService'
@@ -5208,12 +5208,22 @@ console.log("succeededKeys", succeededKeys)
       toBlock: number,
     ) {
       const target = await filter
+      // Size maxWindows to the actual range requested instead of relying on
+      // scanLogsForward's default (100 windows x 10k blocks = a 1M-block
+      // ceiling). A correctly-sized cold-start scan (see blocksForDuration
+      // callers in this file) can be well over 1M blocks on a fast chain
+      // like Arbitrum, so a fixed default here would throw on exactly the
+      // range it's supposed to cover. +1 window of headroom for rounding.
+      const chunkBlocks = Number(process.env.L2_LOG_CHUNK_BLOCKS) || 10_000
+      const blockCount = Math.max(0, toBlock - fromBlock + 1)
+      const maxWindows = Math.ceil(blockCount / chunkBlocks) + 1
       const rawLogs = await scanLogsForward(
         provider,
         target.address ?? archive.target,
         target.topics ?? [],
         fromBlock,
         toBlock,
+        { chunkBlocks, maxWindows },
       )
       return rawLogs
         .map(log => {
@@ -5313,11 +5323,15 @@ console.log("succeededKeys", succeededKeys)
         }
 
         const cp = await prisma.chainData.findUnique({ where: { key: checkpointKey } })
-        // ~12s/block on Arbitrum = ~28800 blocks/day. 4-day cold-start lookback.
+        // 4-day cold-start lookback, sized from the provider's actually
+        // measured block time rather than a hardcoded seconds-per-block
+        // assumption (see blocksForDuration in rpcProvider.ts — a prior
+        // "~12s/block on Arbitrum" assumption here was ~50x off from
+        // Arbitrum Sepolia's measured ~0.253s/block).
         const cold = !cp
         const fromBlock = cp
           ? Math.max(0, Number(cp.value) + 1)
-          : Math.max(0, latestBlock - 28800 * 4)
+          : Math.max(0, latestBlock - await blocksForDuration(provider!, 4 * 24 * 60 * 60))
         if (cold) console.log(`[OptimisticReplication] Cold-start finalize scan: ${fromBlock}..${latestBlock}`)
 
         if (fromBlock <= latestBlock) {
@@ -5441,8 +5455,30 @@ console.log("succeededKeys", succeededKeys)
         const { archiveRead: archive, l2bProvider: provider, l2bMonitor: w } = await getL2bContracts()
 
         const latestBlock = await provider!.getBlockNumber()
-        // Look back ~3 days of blocks
-        const fromBlock = Math.max(0, latestBlock - 28800 * 3)
+        // Checkpointed the same way as autoFinalizeSubmissions: a full
+        // ~3-day-real lookback (CHALLENGE_PERIOD is 2 days on-chain; the
+        // extra day is margin for this monitor's own downtime/restarts) is
+        // only needed once, on cold start. On correctly-sized block ranges
+        // (see blocksForDuration below) a fixed 3-day scan is ~1.3M blocks
+        // on Arbitrum Sepolia — re-scanning that every cycle would both hit
+        // scanLogsForward's maxWindows cap (100 windows x 10k blocks =
+        // 1M-block ceiling) and burn far more RPC calls than necessary,
+        // since every submission in the window is inspected exactly once
+        // (resolveChallenge/slashIncoherentRoot happens synchronously, in
+        // the same cycle the SubmissionCreated event is first seen) — there
+        // is nothing left to re-check on a later cycle for an event already
+        // processed.
+        const monitorCheckpointKey = `optimistic-monitor:${w.getAddress().toLowerCase()}:last-block`
+        const monitorCp = await prisma.chainData.findUnique({ where: { key: monitorCheckpointKey } })
+        // ~3 days of blocks, sized from the provider's actually measured
+        // block time rather than a hardcoded seconds-per-block assumption
+        // (see blocksForDuration in rpcProvider.ts — a prior "~12s/block on
+        // Arbitrum" assumption here was ~50x off from Arbitrum Sepolia's
+        // measured ~0.253s/block).
+        const fromBlock = monitorCp
+          ? Math.max(0, Number(monitorCp.value) + 1)
+          : Math.max(0, latestBlock - await blocksForDuration(provider!, 3 * 24 * 60 * 60))
+        if (!monitorCp) console.log(`[Monitor] Cold-start scan: ${fromBlock}..${latestBlock}`)
 
         // Query ALL SubmissionCreated events (not just ours)
         const events = await scanArchiveEvents(
@@ -5791,6 +5827,18 @@ console.log("succeededKeys", succeededKeys)
             create: { key: 'validator_monitor_resolved', value: { ids: merged } },
           })
         }
+
+        // Advance the scan checkpoint unconditionally. Unlike
+        // autoFinalizeSubmissions' retry queue, losing this write on a
+        // crash (checkpoint written, resolved-set flush lost, or vice
+        // versa) only costs a redundant getSubmission call on the next
+        // cycle for an already-resolved submission — not silent data loss —
+        // so a single transaction isn't needed here.
+        await prisma.chainData.upsert({
+          where: { key: monitorCheckpointKey },
+          create: { key: monitorCheckpointKey, value: latestBlock as any },
+          update: { value: latestBlock as any },
+        })
       } catch (err: any) {
         console.error(`[Monitor] Loop error: ${err?.shortMessage || err?.message}`)
       }
