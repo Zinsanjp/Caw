@@ -14,6 +14,7 @@ import { buildCheckpointMerkleTree } from '../../utils/checkpointMerkle'
 import { tryClaimChallengeLock, releaseChallengeLock } from '../../utils/challengeLock'
 import { withWalletLock } from '../../utils/walletQueue'
 import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
+import { finalizeOwnPendingSubmissions } from '../../utils/archiveFinalize'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { decompressActionText } from '../../utils/decompressActionText'
 import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
@@ -4356,6 +4357,8 @@ console.log("succeededKeys", succeededKeys)
     const archiveAbi = [
       'function stakes(address) view returns (uint256)',
       'function pendingCount(address) view returns (uint256)',
+      'function getValidatorSubmissionCount(address) view returns (uint256)',
+      'function validatorSubmissions(address,uint256) view returns (uint256)',
       'function deposit() payable',
       'function withdraw(uint256)',
       'function submitReplication(uint32 networkId, uint256 startCheckpointId, uint256 endCheckpointId, bytes packedActions, bytes32[] r, bytes32 merkleRoot, bytes32 entryHash)',
@@ -5274,6 +5277,14 @@ console.log("succeededKeys", succeededKeys)
         const retryRecord = await prisma.chainData.findUnique({ where: { key: retryKey } })
         const pendingRetries: RetryItem[] = Array.isArray(retryRecord?.value) ? retryRecord.value as any : []
         const nextRetries: RetryItem[] = []
+
+        // Finalize this validator's own due submissions straight from contract
+        // state first. The event scan below only sees submissions at or after
+        // the stored checkpoint, so a submission the checkpoint has already
+        // passed (a validator stuck before the checkpoint/retry-queue fixes) is
+        // otherwise never found. Anything finalized here reads as not pending in
+        // the retry queue and event scan below and is dropped there.
+        await finalizeOwnPendingSubmissions({ archive: archive as any, archiveW: archiveW as any, self: w.getAddress() })
 
         for (const item of pendingRetries) {
           // getSubmission (read) and finalizeSubmission (write) are
