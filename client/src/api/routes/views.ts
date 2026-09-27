@@ -31,9 +31,13 @@ function hashIP(ip: string): string {
  *      token they no longer hold.
  *
  * Unlike bookmarks/pins, failure here never 401s: views must stay
- * viewable without a session, so any verification failure falls back to
- * the session's own primary token (or undefined with no session, which
- * ViewTracker keys on `ip:${ipHash}` instead).
+ * viewable without a session. An invalid/unauthorized/unrecognized
+ * requested tokenId falls back to the session's own primary token, but a
+ * *stale-ownership* failure (the requested token's on-record owner no
+ * longer matches the session) falls back to undefined instead — returning
+ * ownTokenId there would be a no-op for the common single-token case,
+ * since ownTokenId and requestedId are the same id. No session at all
+ * also returns undefined. Either way ViewTracker keys on `ip:${ipHash}`.
  */
 async function resolveTrustedUserId(req: Request): Promise<number | undefined> {
   await extractSession(req)
@@ -53,7 +57,7 @@ async function resolveTrustedUserId(req: Request): Promise<number | undefined> {
 
   const ownerAddress = user.address.toLowerCase()
   const authedAddresses = (req.sessionData.authorizedAddresses || []).map(a => a.toLowerCase())
-  if (!authedAddresses.includes(ownerAddress)) return ownTokenId
+  if (!authedAddresses.includes(ownerAddress)) return undefined
 
   return requestedId
 }
