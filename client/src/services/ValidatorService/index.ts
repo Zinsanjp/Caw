@@ -5480,6 +5480,40 @@ console.log("succeededKeys", succeededKeys)
           : Math.max(0, latestBlock - await blocksForDuration(provider!, 3 * 24 * 60 * 60))
         if (!monitorCp) console.log(`[Monitor] Cold-start scan: ${fromBlock}..${latestBlock}`)
 
+        // --- Retry queue ---------------------------------------------------
+        // A submission with detected fraud (Mode A or Mode B) that isn't
+        // fully resolved by the end of THIS cycle is kept here and
+        // reprocessed at the start of every following cycle, independent of
+        // the scan checkpoint above. Without this, a submission whose
+        // relayBatch/resolveChallenge/slashIncoherentRoot call fails once
+        // (RPC hiccup, gas spike, LZ fee underpayment) — or that simply
+        // needs another cycle for its challenge to be delivered/resolved —
+        // falls out of the checkpoint's scan window on the very next cycle
+        // (the checkpoint only rescans NEW blocks), and its SubmissionCreated
+        // event is never seen again: the retry is lost permanently.
+        const monitorRetryKey = `optimistic-monitor:${w.getAddress().toLowerCase()}:retry-queue`
+        interface MonitorRetryItem {
+          submissionId: number
+          networkId: number
+          startCp: number
+          endCp: number
+          submitter: string
+        }
+        const retryRow = await prisma.chainData.findUnique({ where: { key: monitorRetryKey } })
+        const pendingMonitorRetries: MonitorRetryItem[] = Array.isArray(retryRow?.value) ? retryRow.value as any : []
+        const nextMonitorRetries: MonitorRetryItem[] = []
+        // A retried item's own ActionsArchived event is almost certainly
+        // older than `fromBlock` (that's the whole reason it's retried), so
+        // give it a much wider, fixed lookback instead. This is a single
+        // submissionId-filtered scan (cheap regardless of range), not the
+        // "every submission" scan below, so widening it doesn't add
+        // meaningful RPC cost. 7 days covers the 2-day on-chain challenge
+        // period plus several cycles of retry margin.
+        const retryArchivedScanFrom = Math.max(0, latestBlock - await blocksForDuration(provider!, 7 * 24 * 60 * 60))
+        // Submissions processed this cycle (retry queue + fresh scan), so a
+        // submission present in both isn't processed twice.
+        const processedThisCycle = new Set<number>()
+
         // Query ALL SubmissionCreated events (not just ours)
         const events = await scanArchiveEvents(
           archive,
@@ -5508,22 +5542,29 @@ console.log("succeededKeys", succeededKeys)
         )
         const newlyResolved: number[] = []
 
-        for (const ev of events) {
-          const args: any = ev.args
-          if (!args) continue
-
-          const submissionId = Number(args[0] || args.submissionId)
-          const submitter = args[1] || args.submitter
-          const networkId = Number(args[2] || args.networkId)
-          const startCp = Number(args[3] || args.startCheckpointId)
-          const endCp = Number(args[4] || args.endCheckpointId)
+        // Shared per-submission verification/challenge logic, used for both
+        // freshly-scanned SubmissionCreated events and items carried over in
+        // the retry queue above. `archivedScanFrom` is the lower bound used
+        // when searching for this submission's own ActionsArchived event —
+        // the moving checkpoint window for fresh events, or the wider fixed
+        // lookback for retried ones (retryArchivedScanFrom).
+        const processSubmission = async (
+          submissionId: number,
+          submitter: string,
+          networkId: number,
+          startCp: number,
+          endCp: number,
+          archivedScanFrom: number,
+        ): Promise<void> => {
+          if (processedThisCycle.has(submissionId)) return
+          processedThisCycle.add(submissionId)
 
           // Skip our own submissions
-          if (submitter.toLowerCase() === w.getAddress().toLowerCase()) continue
+          if (submitter.toLowerCase() === w.getAddress().toLowerCase()) return
 
           // Skip submissions we already know are resolved (saves a
           // getSubmission view call per cycle).
-          if (resolvedSet.has(submissionId)) continue
+          if (resolvedSet.has(submissionId)) return
 
           // Check if still pending
           let merkleRoot: string
@@ -5533,10 +5574,15 @@ console.log("succeededKeys", succeededKeys)
             if (status !== 0) {
               // Cache this for future cycles.
               newlyResolved.push(submissionId)
-              continue
+              return
             }
             merkleRoot = sub[1] // bytes32 merkleRoot
-          } catch { continue }
+          } catch {
+            // Couldn't even check status this cycle (RPC hiccup) — retry
+            // next cycle rather than dropping it.
+            nextMonitorRetries.push({ submissionId, networkId, startCp, endCp, submitter })
+            return
+          }
 
           // Set up contract handles once per submission.
           const resolveAbi = [
@@ -5571,7 +5617,7 @@ console.log("succeededKeys", succeededKeys)
               archive,
               provider,
               archive.filters.ActionsArchived(submissionId),
-              fromBlock, latestBlock,
+              archivedScanFrom, latestBlock,
             )
             const archivedEv: any = archivedEvents[0]
             if (!archivedEv) throw new Error('ActionsArchived event missing')
@@ -5730,7 +5776,13 @@ console.log("succeededKeys", succeededKeys)
 
               const lockHolder = w.getAddress().toLowerCase()
               const claimed = await tryClaimChallengeLock('slashIncoherent', submissionId, 0, lockHolder, 10 * 60 * 1000)
-              if (!claimed) continue
+              if (!claimed) {
+                // Another node (or a previous cycle) already holds this
+                // lock — keep watching until the submission actually
+                // resolves, instead of dropping it here.
+                nextMonitorRetries.push({ submissionId, networkId, startCp, endCp, submitter })
+                return
+              }
 
               try {
                 // Fetch the originating submitReplication tx via ActionsArchived
@@ -5741,7 +5793,7 @@ console.log("succeededKeys", succeededKeys)
                   archive,
                   provider,
                   archive.filters.ActionsArchived(submissionId),
-                  fromBlock, latestBlock,
+                  archivedScanFrom, latestBlock,
                 )
                 const archivedEv: any = archivedEvents[0]
                 if (!archivedEv) throw new Error('ActionsArchived event missing')
@@ -5772,13 +5824,21 @@ console.log("succeededKeys", succeededKeys)
               } catch (e: any) {
                 console.error(`[Monitor] slashIncoherentRoot failed for ${submissionId}: ${e?.shortMessage || e?.message}`)
                 await releaseChallengeLock('slashIncoherent', submissionId, 0, 'error')
+                // Still fraudulent and still unresolved — keep retrying
+                // instead of letting the checkpoint carry it out of range.
+                nextMonitorRetries.push({ submissionId, networkId, startCp, endCp, submitter })
               }
-              continue
+              return
             }
 
             if (!submitterHashes) {
               console.warn(`[Monitor] Submission ${submissionId}: no submitter view available — skipping`)
-              continue
+              // Couldn't verify this cycle (ActionsArchived not found /
+              // decode failed) — try again next cycle rather than
+              // dropping it, since this is often a transient RPC/indexing
+              // gap.
+              nextMonitorRetries.push({ submissionId, networkId, startCp, endCp, submitter })
+              return
             }
 
             // Mode B detection: compare each submitter-claimed checkpoint
@@ -5807,11 +5867,48 @@ console.log("succeededKeys", succeededKeys)
             if (fraudulentCps.length > 0) {
               try { await relayBatch(fraudulentCps, 'mode B') }
               catch (e: any) { console.error(`[Monitor] Failed to relay batch for submission ${submissionId}: ${e?.shortMessage || e?.message}`) }
+              // Whether relayBatch just succeeded, failed, or a challenge
+              // was already delivered and is merely awaiting
+              // resolveChallenge: this submission stays fraudulent-and-
+              // pending until its on-chain status flips off 0. Keep
+              // watching it next cycle regardless of outcome here.
+              nextMonitorRetries.push({ submissionId, networkId, startCp, endCp, submitter })
             } else {
               console.log(`[Monitor] Submission ${submissionId} verified OK (network ${networkId}, ${startCp}..${endCp}, submitter ${submitter.slice(0, 10)}...)`)
             }
           } catch (err: any) {
             console.warn(`[Monitor] Error verifying submission ${submissionId}: ${err?.shortMessage || err?.message}`)
+            nextMonitorRetries.push({ submissionId, networkId, startCp, endCp, submitter })
+          }
+        }
+
+        // Reprocess anything carried over from a previous cycle first, so a
+        // submission that would otherwise fall out of the scan window below
+        // keeps getting checked until it actually resolves.
+        for (const item of pendingMonitorRetries) {
+          try {
+            await processSubmission(item.submissionId, item.submitter, item.networkId, item.startCp, item.endCp, retryArchivedScanFrom)
+          } catch (err: any) {
+            console.warn(`[Monitor] Error reprocessing retry-queue submission ${item.submissionId}: ${err?.shortMessage || err?.message}`)
+            nextMonitorRetries.push(item)
+          }
+        }
+
+        for (const ev of events) {
+          const args: any = ev.args
+          if (!args) continue
+
+          const submissionId = Number(args[0] || args.submissionId)
+          const submitter = args[1] || args.submitter
+          const networkId = Number(args[2] || args.networkId)
+          const startCp = Number(args[3] || args.startCheckpointId)
+          const endCp = Number(args[4] || args.endCheckpointId)
+
+          try {
+            await processSubmission(submissionId, submitter, networkId, startCp, endCp, fromBlock)
+          } catch (err: any) {
+            console.warn(`[Monitor] Error verifying submission ${submissionId}: ${err?.shortMessage || err?.message}`)
+            nextMonitorRetries.push({ submissionId, networkId, startCp, endCp, submitter })
           }
         }
 
@@ -5828,17 +5925,26 @@ console.log("succeededKeys", succeededKeys)
           })
         }
 
-        // Advance the scan checkpoint unconditionally. Unlike
-        // autoFinalizeSubmissions' retry queue, losing this write on a
-        // crash (checkpoint written, resolved-set flush lost, or vice
-        // versa) only costs a redundant getSubmission call on the next
-        // cycle for an already-resolved submission — not silent data loss —
-        // so a single transaction isn't needed here.
-        await prisma.chainData.upsert({
-          where: { key: monitorCheckpointKey },
-          create: { key: monitorCheckpointKey, value: latestBlock as any },
-          update: { value: latestBlock as any },
-        })
+        // Advance the scan checkpoint and the retry queue together. A
+        // submission is only ever dropped from the retry queue once it's
+        // either verified clean or its on-chain status has actually
+        // resolved (see newlyResolved above) — never just because a
+        // relay/resolve/slash call happened to fail this cycle. Writing
+        // both keys in one transaction keeps them consistent with each
+        // other (mirrors autoFinalizeSubmissions' pairing of its own
+        // checkpoint + retry queue).
+        await prisma.$transaction([
+          prisma.chainData.upsert({
+            where: { key: monitorCheckpointKey },
+            create: { key: monitorCheckpointKey, value: latestBlock as any },
+            update: { value: latestBlock as any },
+          }),
+          prisma.chainData.upsert({
+            where: { key: monitorRetryKey },
+            create: { key: monitorRetryKey, value: nextMonitorRetries as any },
+            update: { value: nextMonitorRetries as any },
+          }),
+        ])
       } catch (err: any) {
         console.error(`[Monitor] Loop error: ${err?.shortMessage || err?.message}`)
       }
