@@ -47,10 +47,15 @@ const PARENT_USER_ID = BASE + 1
     ;({ countManager } = await import('../../src/services/CountManager'))
   })
 
+  const RECIPIENT_ID = BASE + 2
+  const ALL_USERS = [USER_ID, PARENT_USER_ID, RECIPIENT_ID]
+
   afterEach(async () => {
-    await prisma.reply.deleteMany({ where: { userId: USER_ID } })
-    await prisma.caw.deleteMany({ where: { userId: { in: [USER_ID, PARENT_USER_ID] } } })
-    await prisma.user.deleteMany({ where: { tokenId: { in: [USER_ID, PARENT_USER_ID] } } })
+    await prisma.tip.deleteMany({ where: { senderId: { in: ALL_USERS } } })
+    await prisma.like.deleteMany({ where: { userId: { in: ALL_USERS } } })
+    await prisma.reply.deleteMany({ where: { userId: { in: ALL_USERS } } })
+    await prisma.caw.deleteMany({ where: { userId: { in: ALL_USERS } } })
+    await prisma.user.deleteMany({ where: { tokenId: { in: ALL_USERS } } })
   })
 
   after(async () => {
@@ -73,19 +78,32 @@ const PARENT_USER_ID = BASE + 1
       })
 
       if (replyRecord) {
-        // Reply.replyCawId is a foreign key into Caw, so the Reply row
-        // must go first or the Caw delete below violates the constraint.
+        // Reply.replyCawId is a foreign key into Caw, so drop the Reply row
+        // first, then recount the parent.
         await tx.reply.delete({ where: { id: replyRecord.id } })
-        await tx.caw.delete({ where: { id: pendingCaw.id } })
         const actualReplyCount = await tx.reply.count({ where: { cawId: replyRecord.cawId, pending: false } })
         await tx.caw.update({ where: { id: replyRecord.cawId }, data: { commentCount: actualReplyCount } })
       } else {
-        await tx.caw.delete({ where: { id: pendingCaw.id } })
         await countManager.onStatusChanged(tx, 'caw', pendingCaw.id, 'PENDING', 'FAILED', {
           userId: pendingCaw.userId,
           action: pendingCaw.action,
           originalCawId: pendingCaw.originalCawId,
         })
+      }
+
+      // Rows still pointing at this caw (a thread's next chunk via Reply.cawId,
+      // a Like, a quote/child via originalCawId, an embedded Tip) would make
+      // the delete fail or silently null the link. Fall back to FAILED, as
+      // DataCleaner's sweep does.
+      const referenced =
+        (await tx.reply.count({ where: { cawId: pendingCaw.id } })) > 0 ||
+        (await tx.like.count({ where: { cawId: pendingCaw.id } })) > 0 ||
+        (await tx.caw.count({ where: { originalCawId: pendingCaw.id } })) > 0 ||
+        (await tx.tip.count({ where: { cawId: pendingCaw.id } })) > 0
+      if (referenced) {
+        await tx.caw.update({ where: { id: pendingCaw.id }, data: { status: 'FAILED' } })
+      } else {
+        await tx.caw.delete({ where: { id: pendingCaw.id } })
       }
     })
   }
@@ -154,5 +172,64 @@ const PARENT_USER_ID = BASE + 1
 
     const user = await prisma.user.findUnique({ where: { tokenId: USER_ID } })
     expect(user!.cawCount, 'cawCount must stay as-is when the cancel loses the race').to.equal(1)
+  })
+
+  // Review feedback (nyaromesama, PR #216): several relations into Caw have
+  // no onDelete, so deleting a pending caw that something points at would
+  // throw and turn a successful cancel into a 500. Those cases must fall
+  // back to FAILED plus the same count rollback.
+  async function expectFailedNotDeleted(cawonce: number) {
+    const caw = await prisma.caw.findUnique({ where: { userId_cawonce: { userId: USER_ID, cawonce } } })
+    expect(caw, 'the referenced caw must be kept, not deleted').to.exist
+    expect(caw!.status, 'and marked FAILED, as the sweep does').to.equal('FAILED')
+    const user = await prisma.user.findUnique({ where: { tokenId: USER_ID } })
+    expect(user!.cawCount, 'cawCount is still rolled back').to.equal(1)
+  }
+
+  it('4. thread: a later chunk\'s Reply row points at the cancelled caw -> no throw, FAILED, cawCount rolled back', async () => {
+    await prisma.user.create({ data: { id: USER_ID, tokenId: USER_ID, username: `u${USER_ID}`, cawCount: 2 } })
+    const first = await prisma.caw.create({
+      data: { userId: USER_ID, cawonce: 10, content: 'chunk 1', action: 'CAW', status: 'PENDING' },
+    })
+    const second = await prisma.caw.create({
+      data: { userId: USER_ID, cawonce: 11, content: 'chunk 2', action: 'CAW', status: 'PENDING' },
+    })
+    await prisma.reply.create({ data: { userId: USER_ID, cawId: first.id, replyCawId: second.id, pending: true } })
+
+    await cancelPendingCaw(USER_ID, 10)
+
+    await expectFailedNotDeleted(10)
+    const chunk2 = await prisma.caw.findUnique({ where: { id: second.id } })
+    expect(chunk2!.status, 'the other chunk is untouched').to.equal('PENDING')
+  })
+
+  it('5. a Like on the pending caw -> no throw, FAILED, cawCount rolled back', async () => {
+    await prisma.user.create({ data: { id: USER_ID, tokenId: USER_ID, username: `u${USER_ID}`, cawCount: 2 } })
+    const caw = await prisma.caw.create({
+      data: { userId: USER_ID, cawonce: 20, content: 'liked while pending', action: 'CAW', status: 'PENDING' },
+    })
+    await prisma.like.create({ data: { userId: USER_ID, cawId: caw.id, action: 'LIKE', pending: true } })
+
+    await cancelPendingCaw(USER_ID, 20)
+
+    await expectFailedNotDeleted(20)
+  })
+
+  it('6. an embedded Tip on the pending caw -> no throw, FAILED, cawCount rolled back, Tip keeps its link', async () => {
+    await prisma.user.create({ data: { id: USER_ID, tokenId: USER_ID, username: `u${USER_ID}`, cawCount: 2 } })
+    await prisma.user.create({ data: { id: RECIPIENT_ID, tokenId: RECIPIENT_ID, username: `u${RECIPIENT_ID}` } })
+    const caw = await prisma.caw.create({
+      data: { userId: USER_ID, cawonce: 30, content: 'post with a tip', action: 'CAW', status: 'PENDING' },
+    })
+    const tip = await prisma.tip.create({
+      data: { senderId: USER_ID, recipientId: RECIPIENT_ID, amount: 5, cawId: caw.id, cawonce: 30, pending: true },
+    })
+
+    await cancelPendingCaw(USER_ID, 30)
+
+    await expectFailedNotDeleted(30)
+    const tipAfter = await prisma.tip.findUnique({ where: { id: tip.id } })
+    expect(tipAfter, 'the pending tip is left for cleanupPendingTips').to.exist
+    expect(tipAfter!.cawId, 'and still points at the caw').to.equal(caw.id)
   })
 })
