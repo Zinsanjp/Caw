@@ -428,6 +428,46 @@ router.post(
             })
           }
         })
+      } else if (actionType === 0 /* CAW */ && typeof data.cawonce === 'number') {
+        // Plain caw wrote a Caw row with action=CAW, status=PENDING. A
+        // top-level post bumps user.cawCount (via /api/actions's
+        // countManager.onCawCreated); a reply instead bumps the parent's
+        // commentCount through a paired Reply row (pending=true) +
+        // onReplyCreated -- its own originalCawId is left null (see the
+        // isReply gate in /api/actions), so we look it up by replyCawId
+        // instead, same as DataCleaner's cleanupPendingCaws does for a
+        // stale pending caw. Cancelling deletes the row and rolls back
+        // whichever count was actually bumped. Indexer raced ahead =
+        // status no longer PENDING; skip.
+        await prisma.$transaction(async (tx: any) => {
+          const pendingCaw = await tx.caw.findFirst({
+            where: { userId: entry.senderId, cawonce: data.cawonce, status: 'PENDING', action: 'CAW' },
+            select: { id: true, userId: true, action: true, originalCawId: true },
+          })
+          if (!pendingCaw) return
+
+          const replyRecord = await tx.reply.findFirst({
+            where: { replyCawId: pendingCaw.id },
+            select: { id: true, cawId: true },
+          })
+
+          if (replyRecord) {
+            // Reply.replyCawId is a foreign key into Caw, so the Reply row
+            // must go first or the Caw delete below violates the
+            // constraint.
+            await tx.reply.delete({ where: { id: replyRecord.id } })
+            await tx.caw.delete({ where: { id: pendingCaw.id } })
+            const actualReplyCount = await tx.reply.count({ where: { cawId: replyRecord.cawId, pending: false } })
+            await tx.caw.update({ where: { id: replyRecord.cawId }, data: { commentCount: actualReplyCount } })
+          } else {
+            await tx.caw.delete({ where: { id: pendingCaw.id } })
+            await countManager.onStatusChanged(tx, 'caw', pendingCaw.id, 'PENDING', 'FAILED', {
+              userId: pendingCaw.userId,
+              action: pendingCaw.action,
+              originalCawId: pendingCaw.originalCawId,
+            })
+          }
+        })
       }
 
       return res.json({ ok: true })
