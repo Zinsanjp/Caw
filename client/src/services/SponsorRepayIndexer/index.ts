@@ -24,6 +24,7 @@
 // DepositWatcher in the L1 watcher family; L2 is an independent poll loop.
 
 import 'dotenv/config'
+import { createSafeRedis } from '../../lib/redisClient'
 import { z } from 'zod'
 import { ethers } from 'ethers'
 import Redis from 'ioredis'
@@ -295,7 +296,7 @@ export const sponsorRepayIndexerService: Service = {
     ctx.declareLoop('SponsorRepayIndexer:L1', Math.max(cfg.pollIntervalMs * 3, 180_000))
     ctx.declareLoop('SponsorRepayIndexer:L2', Math.max(cfg.pollIntervalMs * 3, 180_000))
 
-    const redis = new Redis(cfg.redisUrl)
+    const redis = createSafeRedis(cfg.redisUrl)
 
     let isAlive = true
     let l1Loop: ReturnType<typeof makePollLoop> | null = null

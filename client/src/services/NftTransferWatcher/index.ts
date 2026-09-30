@@ -7,6 +7,7 @@
 // Once this service is running, profile pickers and /user/:tokenId pages
 // stay accurate without any poll-style scan of all users.
 import 'dotenv/config'
+import { createSafeRedis } from '../../lib/redisClient'
 import { z } from 'zod'
 import { ethers } from 'ethers'
 import Redis from 'ioredis'
@@ -213,12 +214,12 @@ export const nftTransferWatcherService: Service = {
 
     const rpcUrl = getL1HttpRpcUrl(cfg.l1RpcUrl)
     const contractAddress = cfg.cawProfileAddress || CAW_NAMES_ADDRESS
-    const redis = new Redis(cfg.redisUrl)
+    const redis = createSafeRedis(cfg.redisUrl)
 
     // Separate subscriber connection — ioredis connections in subscriber mode
     // cannot run normal commands. Subscribe to the poke channel so the API
     // can trigger an immediate targeted index without waiting for the poll cycle.
-    const subscriber = new Redis(cfg.redisUrl)
+    const subscriber = createSafeRedis(cfg.redisUrl)
     // In-flight de-dupe: skip concurrent findOrCreateUser calls for the same
     // tokenId if a poke burst arrives before the first call completes.
     const indexingInFlight = new Set<number>()

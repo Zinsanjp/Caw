@@ -1,4 +1,5 @@
 //src/services/ActionProcessor/index.ts
+import { createSafeRedis } from '../../lib/redisClient'
 import { ActionType as PrismaActionType } from '@prisma/client'
 import { prisma } from '../../prismaClient'
 import { Service } from '../../Service'
@@ -35,7 +36,7 @@ export const actionProcessorService: Service = {
 
   start(_cfg, ctx) {
     const { redisUrl } = Config.parse(_cfg)
-    const redis = new Redis(redisUrl)
+    const redis = createSafeRedis(redisUrl)
     let stopRequested = false
 
     // ActionProcessor is event-driven (Redis pub/sub). We heartbeat on each

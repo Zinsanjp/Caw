@@ -1,4 +1,5 @@
 // src/services/RawEventsGatherer/index.ts
+import { createSafeRedis } from '../../lib/redisClient'
 import { z } from 'zod'
 import Redis from 'ioredis'
 import { Service } from '../../Service'
@@ -57,7 +58,7 @@ export const rawEventsGathererService: Service = {
       throw new Error('Missing L2_RPC_URL in environment variables')
     }
 
-    const redis = new Redis(redisUrl)
+    const redis = createSafeRedis(redisUrl)
     let stopListener: () => void
 
     const started = (async () => {

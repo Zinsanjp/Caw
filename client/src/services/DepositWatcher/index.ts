@@ -20,6 +20,7 @@
 // mental model.
 
 import 'dotenv/config'
+import { createSafeRedis } from '../../lib/redisClient'
 import { z } from 'zod'
 import { ethers } from 'ethers'
 import Redis from 'ioredis'
@@ -80,7 +81,7 @@ export const depositWatcherService: Service = {
 
     const rpcUrl = getL1HttpRpcUrl(cfg.l1RpcUrl)
     const contractAddress = cfg.cawProfileAddress || CAW_NAMES_ADDRESS
-    const redis = new Redis(cfg.redisUrl)
+    const redis = createSafeRedis(cfg.redisUrl)
 
     let alive = true
     let pollTimer: ReturnType<typeof setTimeout> | null = null
