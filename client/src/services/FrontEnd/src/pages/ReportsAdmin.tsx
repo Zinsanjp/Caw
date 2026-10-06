@@ -16,6 +16,11 @@ interface Report {
   reviewedBy: string | null
   resolution: string | null
   createdAt: string
+  // Added by GET /api/reports for the moderator list; absent on older servers.
+  reporterIdUsername?: string | null
+  postAuthorIdUsername?: string | null
+  postStatus?: string | null
+  postContent?: string | null
 }
 
 const STATUS_COLORS: Record<string, string> = {
@@ -213,12 +218,20 @@ const ReportsAdmin: React.FC = () => {
                         </Link>
                       )}
                       <span className={`text-xs ${isDark ? 'text-white/30' : 'text-gray-400'}`}>
-                        {report.postId === 0 ? 'Reported user ID' : 'Author ID'}: {report.postAuthorId}
+                        {report.postId === 0 ? 'Reported user ID' : 'Author ID'}: {report.postAuthorId}{report.postAuthorIdUsername ? ` (@${report.postAuthorIdUsername})` : ''}
                       </span>
                       <span className={`text-xs ${isDark ? 'text-white/30' : 'text-gray-400'}`}>
-                        Reporter ID: {report.reporterId}
+                        Reporter ID: {report.reporterId}{report.reporterIdUsername ? ` (@${report.reporterIdUsername})` : ''}
                       </span>
                     </div>
+
+                    {/* Reported post context. The server returns content only for
+                        visible (SUCCESS) posts. */}
+                    {report.postId !== 0 && report.postStatus && (
+                      <p className={`text-sm mt-2 whitespace-pre-wrap break-words ${isDark ? 'text-white/80' : 'text-gray-800'}`}>
+                        {report.postContent ?? (report.postStatus === 'HIDDEN' ? 'Post removed by its author' : `Post status: ${report.postStatus}`)}
+                      </p>
+                    )}
 
                     {/* Details */}
                     {report.details && (

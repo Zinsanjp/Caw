@@ -107,7 +107,53 @@ router.get('/', requireModerator, async (req, res) => {
 
     const total = await prisma.report.count({ where })
 
-    return res.json({ reports, total })
+    // Context for the moderator list: usernames for reporter / author and a
+    // short excerpt of the reported post. Two batched queries per page, no
+    // per-row lookups. Existing fields are unchanged; these are extra fields.
+    // Post content is only returned for SUCCESS posts: a HIDDEN post was
+    // suppressed by its author (GET /api/caws/:id returns 410 for it), FAILED
+    // is creator-only there, and PENDING is not confirmed yet.
+    // tokenId 0 is a real tokenId, so user ids are looked up with >= 0; only
+    // postId 0 is a sentinel (user report).
+    const userIds = new Set<number>()
+    const postIds = new Set<number>()
+    for (const r of reports) {
+      if (r.reporterId >= 0) userIds.add(r.reporterId)
+      if (r.postAuthorId >= 0) userIds.add(r.postAuthorId)
+      if (r.postId > 0) postIds.add(r.postId)
+    }
+    const usernameByTokenId = new Map<number, string>()
+    if (userIds.size > 0) {
+      const users = await prisma.user.findMany({
+        where: { tokenId: { in: Array.from(userIds) } },
+        select: { tokenId: true, username: true },
+      })
+      for (const u of users) usernameByTokenId.set(u.tokenId, u.username)
+    }
+    const cawById = new Map<number, { status: string; content: string }>()
+    if (postIds.size > 0) {
+      const caws = await prisma.caw.findMany({
+        where: { id: { in: Array.from(postIds) } },
+        select: { id: true, status: true, content: true },
+      })
+      for (const c of caws) cawById.set(c.id, { status: c.status, content: c.content })
+    }
+    const excerpt = (content: string) => {
+      const chars = Array.from(content)
+      return chars.length > 200 ? chars.slice(0, 200).join('') + '...' : content
+    }
+    const enriched = reports.map(r => {
+      const caw = r.postId > 0 ? cawById.get(r.postId) : undefined
+      return {
+        ...r,
+        reporterIdUsername: usernameByTokenId.get(r.reporterId) ?? null,
+        postAuthorIdUsername: usernameByTokenId.get(r.postAuthorId) ?? null,
+        postStatus: caw?.status ?? null,
+        postContent: caw && caw.status === 'SUCCESS' ? excerpt(caw.content) : null,
+      }
+    })
+
+    return res.json({ reports: enriched, total })
   } catch (error) {
     console.error('GET /api/reports error:', error)
     return res.status(500).json({ error: 'Failed to fetch reports' })
