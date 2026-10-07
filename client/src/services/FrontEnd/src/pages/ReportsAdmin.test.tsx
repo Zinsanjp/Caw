@@ -7,6 +7,7 @@ import React from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, cleanup } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter } from 'react-router-dom'
 
 const { apiFetch } = vi.hoisted(() => ({ apiFetch: vi.fn() }))
 
@@ -37,7 +38,11 @@ const patchCalls = () => apiFetch.mock.calls.filter(([, init]) => init?.method =
 async function clickAction(promptResult: string | null) {
   const promptStub = vi.fn(() => promptResult)
   vi.stubGlobal('prompt', promptStub)
-  render(<ReportsAdmin />)
+  render(
+    <MemoryRouter>
+      <ReportsAdmin />
+    </MemoryRouter>,
+  )
   const button = await screen.findByRole('button', { name: 'Action' })
   await userEvent.click(button)
   return promptStub
