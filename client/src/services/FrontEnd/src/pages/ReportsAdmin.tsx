@@ -19,6 +19,8 @@ interface Report {
   // Added by GET /api/reports for the moderator list; absent on older servers.
   reporterIdUsername?: string | null
   postAuthorIdUsername?: string | null
+  postActualAuthorId?: number | null
+  postAuthorMismatch?: boolean
   postStatus?: string | null
   postContent?: string | null
 }
@@ -218,7 +220,10 @@ const ReportsAdmin: React.FC = () => {
                         </Link>
                       )}
                       <span className={`text-xs ${isDark ? 'text-white/30' : 'text-gray-400'}`}>
-                        {report.postId === 0 ? 'Reported user ID' : 'Author ID'}: {report.postAuthorId}{report.postAuthorIdUsername ? ` (@${report.postAuthorIdUsername})` : ''}
+                        {report.postId === 0 ? 'Reported user ID' : 'Author ID'}: {report.postAuthorId}
+                        {report.postAuthorMismatch
+                          ? ` (stored value; the post's author is ${report.postActualAuthorId}${report.postAuthorIdUsername ? ` @${report.postAuthorIdUsername}` : ''})`
+                          : (report.postAuthorIdUsername ? ` (@${report.postAuthorIdUsername})` : '')}
                       </span>
                       <span className={`text-xs ${isDark ? 'text-white/30' : 'text-gray-400'}`}>
                         Reporter ID: {report.reporterId}{report.reporterIdUsername ? ` (@${report.reporterIdUsername})` : ''}

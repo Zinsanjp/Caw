@@ -40,6 +40,7 @@ const CAWS = [
   let plainToken = ''
   let safe = false
   const postIdByKey: Record<string, number> = {}
+  let spoofedPostId = 0
   let rows: any[] = []
 
   async function get(token?: string) {
@@ -83,6 +84,15 @@ const CAWS = [
         data: { reporterId: reporter.tokenId, postId: row.id, postAuthorId: author.tokenId, reason: 'SPAM' },
       })
     }
+    // a report on a real post filed with the wrong postAuthorId (the API stores
+    // whatever the reporter sends)
+    const spoofedCaw = await prisma.caw.create({
+      data: { userId: author.tokenId, content: 'spoofed author report', action: 'CAW' as const, cawonce: 5, status: 'SUCCESS' },
+    })
+    spoofedPostId = spoofedCaw.id
+    await prisma.report.create({
+      data: { reporterId: reporter.tokenId, postId: spoofedCaw.id, postAuthorId: plain.tokenId, reason: 'SPAM' },
+    })
     // a user report (postId 0)
     await prisma.report.create({
       data: { reporterId: reporter.tokenId, postId: 0, postAuthorId: author.tokenId, reason: 'HARASSMENT', details: 'Reported user: @x' },
@@ -130,8 +140,8 @@ const CAWS = [
     expect(r.json.error).to.equal('NOT_MODERATOR')
   })
 
-  it('returns all six rows with the original fields intact', () => {
-    expect(rows).to.have.length(6)
+  it('returns all seven rows with the original fields intact', () => {
+    expect(rows).to.have.length(7)
     expect(byPost('ok').reason).to.equal('SPAM')
     expect(byPost('ok').postAuthorId).to.equal(author.tokenId)
   })
@@ -141,7 +151,17 @@ const CAWS = [
     expect(r.reporterIdUsername).to.equal(reporter.username)
     expect(r.postAuthorIdUsername).to.equal(author.username)
     expect(r.postStatus).to.equal('SUCCESS')
+    expect(r.postActualAuthorId).to.equal(author.tokenId)
+    expect(r.postAuthorMismatch).to.equal(false)
     expect(r.postContent).to.equal('hello report context')
+  })
+
+  it('names the post author from the Caw row when the reporter sent a different postAuthorId', () => {
+    const r = rows.find(x => x.postId === spoofedPostId)
+    expect(r.postAuthorId).to.equal(plain.tokenId)
+    expect(r.postActualAuthorId).to.equal(author.tokenId)
+    expect(r.postAuthorIdUsername).to.equal(author.username)
+    expect(r.postAuthorMismatch).to.equal(true)
   })
 
   it('cuts long content to 200 characters plus an ellipsis', () => {
