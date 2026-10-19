@@ -2,7 +2,7 @@ import { expect } from 'chai'
 import request from 'supertest'
 import { Express } from 'express'
 import { prisma } from '../helpers/test-setup'
-import { mergeFeedRows, fetchSplitFeed } from '../../src/api/shared/feedPage'
+import { mergeFeedRows, fetchSplitFeed, MAX_FOLLOWED_IN_LIST } from '../../src/api/shared/feedPage'
 
 // These tests write to the database. They fail (not skip) anywhere but a caw_test_ database,
 // so a misconfigured run cannot pass silently.
@@ -160,5 +160,139 @@ describe('GET /api/caws: logged-in home feed', function () {
   it('anonymous: only SUCCESS posts, paged in the same order', async () => {
     const got = await collect(5, {})
     expect(got).to.deep.equal(expectedIds(undefined))
+  })
+})
+
+describe('GET /api/caws?filter=following', function () {
+  this.timeout(120_000)
+  let app: Express
+  const V = 9201       // viewer
+  const F1 = 9202      // followed
+  const F2 = 9203      // followed
+  const UNF = 9204     // follow row exists but action is UNFOLLOW
+  const PEND = 9205    // follow row exists but is still PENDING
+  const BLK = 9206     // followed and blocked
+  const NF = 9207      // not followed
+  const ZERO = 9208    // follows nobody
+  const MANY = 9209    // follows more accounts than MAX_FOLLOWED_IN_LIST
+  const BULK = 20_000  // first tokenId of the accounts MANY follows
+  const T0 = Date.parse('2026-10-01T00:00:00Z')
+  const at = (minutes: number) => new Date(T0 + minutes * 60_000)
+  type Row = { id: number; userId: number; status: Status; createdAt: Date }
+  let rows: Row[] = []
+
+  before(() => {
+    if (!SAFE_DB) throw new Error('feedSplit tests need DATABASE_URL to name a caw_test_ database')
+    process.env.ELASTICSEARCH_NODE = 'http://127.0.0.1:1'
+    const { createTestApp } = require('../helpers/test-setup')
+    app = createTestApp()
+  })
+
+  async function resetRows() {
+    await prisma.follow.deleteMany()
+    await prisma.block.deleteMany()
+    await prisma.caw.deleteMany()
+    await prisma.user.deleteMany()
+  }
+
+  beforeEach(async () => {
+    await resetRows()
+    for (const tokenId of [V, F1, F2, UNF, PEND, BLK, NF, ZERO, MANY]) {
+      await prisma.user.create({ data: { id: tokenId, tokenId, username: `following_${tokenId}` } })
+    }
+    // Accounts that MANY follows. Only the first one posts.
+    const bulk = Array.from({ length: MAX_FOLLOWED_IN_LIST + 1 }, (_, i) => BULK + i)
+    await prisma.user.createMany({ data: bulk.map((tokenId) => ({ id: tokenId, tokenId, username: `following_bulk_${tokenId}` })) })
+    await prisma.follow.createMany({ data: bulk.map((followingId) => ({ followerId: MANY, followingId, action: 'FOLLOW', status: 'SUCCESS' })) })
+    await prisma.follow.createMany({
+      data: [
+        { followerId: V, followingId: F1, action: 'FOLLOW', status: 'SUCCESS' },
+        { followerId: V, followingId: F2, action: 'FOLLOW', status: 'SUCCESS' },
+        { followerId: V, followingId: UNF, action: 'UNFOLLOW', status: 'SUCCESS' },
+        { followerId: V, followingId: PEND, action: 'FOLLOW', status: 'PENDING' },
+        { followerId: V, followingId: BLK, action: 'FOLLOW', status: 'SUCCESS' },
+      ],
+    })
+    await prisma.block.create({ data: { blockerId: V, blockedId: BLK } })
+
+    const specs: Array<[number, Status, number]> = [
+      [F1, 'SUCCESS', 10], [F1, 'SUCCESS', 10], [F2, 'SUCCESS', 7], [F1, 'HIDDEN', 12], [F2, 'PENDING', 11], [F1, 'FAILED', 6],
+      [UNF, 'SUCCESS', 9], [PEND, 'SUCCESS', 8], [BLK, 'SUCCESS', 13], [NF, 'SUCCESS', 14], [NF, 'PENDING', 15],
+      [V, 'SUCCESS', 5], [V, 'PENDING', 4], [V, 'FAILED', 3], [V, 'PENDING', 10], [V, 'HIDDEN', 2],
+      [ZERO, 'SUCCESS', 1], [ZERO, 'PENDING', 2], [ZERO, 'FAILED', 3],
+      [BULK, 'SUCCESS', 6], [BULK, 'SUCCESS', 6], [MANY, 'PENDING', 9], [BULK + 1, 'SUCCESS', 20],
+    ]
+    for (let i = 1; i <= 25; i++) specs.push([F1, 'SUCCESS', i % 7])
+    const cawonce: Record<number, number> = {}
+    rows = []
+    for (const [userId, status, minutes] of specs) {
+      cawonce[userId] = (cawonce[userId] || 0) + 1
+      const r = await prisma.caw.create({
+        data: { userId, content: `following ${userId}-${cawonce[userId]}`, action: 'CAW', cawonce: cawonce[userId], status, createdAt: at(minutes) },
+      })
+      rows.push({ id: r.id, userId, status, createdAt: r.createdAt })
+    }
+  })
+
+  afterEach(async () => {
+    await resetRows()
+  })
+
+  // Independent oracle: posts by me or by confirmed follows (not blocked), SUCCESS for everyone,
+  // PENDING/FAILED only my own, in feed order.
+  function expectedIds(viewer: number, followed: number[], blocked: number[]): number[] {
+    return rows
+      .filter((r) => {
+        if (blocked.includes(r.userId)) return false
+        const mine = r.userId === viewer
+        if (!mine && !followed.includes(r.userId)) return false
+        if (r.status === 'SUCCESS') return true
+        return mine && (r.status === 'PENDING' || r.status === 'FAILED')
+      })
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime() || b.id - a.id)
+      .map((r) => r.id)
+  }
+
+  async function collect(limit: number, viewer: number): Promise<number[]> {
+    const ids: number[] = []
+    let cursor: number | undefined
+    for (let guard = 0; guard < 500; guard++) {
+      const query = cursor ? `&cursor=${cursor}` : ''
+      const res = await request(app).get(`/api/caws?limit=${limit}&filter=following${query}`).set({ 'x-user-id': String(viewer) })
+      expect(res.status).to.equal(200)
+      ids.push(...res.body.items.map((item: any) => Number(item.id)))
+      if (!res.body.nextCursor) break
+      cursor = Number(res.body.nextCursor)
+    }
+    return ids
+  }
+
+  it('shows my own posts of every visible status and confirmed follows, in order, for every page size', async () => {
+    for (const limit of [1, 2, 5, 20]) {
+      expect(await collect(limit, V), `limit=${limit}`).to.deep.equal(expectedIds(V, [F1, F2], [BLK]))
+    }
+  })
+
+  it('leaves out unfollowed, pending-follow, blocked and not-followed authors, and other users PENDING/FAILED', async () => {
+    const got = new Set(await collect(50, V))
+    for (const r of rows) {
+      if ([UNF, PEND, BLK, NF].includes(r.userId)) expect(got.has(r.id), `id=${r.id} user=${r.userId}`).to.equal(false)
+      if (r.userId === F2 && r.status === 'PENDING') expect(got.has(r.id)).to.equal(false)
+      if (r.status === 'HIDDEN') expect(got.has(r.id)).to.equal(false)
+    }
+  })
+
+  it('a viewer who follows nobody sees only their own posts, including PENDING and FAILED', async () => {
+    const got = await collect(2, ZERO)
+    expect(got).to.deep.equal(expectedIds(ZERO, [], []))
+    expect(got.length).to.equal(3)
+  })
+
+  it('a viewer who follows more accounts than the IN-list limit gets the same result', async () => {
+    for (const limit of [2, 20]) {
+      const got = await collect(limit, MANY)
+      expect(got, `limit=${limit}`).to.deep.equal(expectedIds(MANY, Array.from({ length: MAX_FOLLOWED_IN_LIST + 1 }, (_, i) => BULK + i), []))
+      expect(got.length).to.be.greaterThan(0)
+    }
   })
 })

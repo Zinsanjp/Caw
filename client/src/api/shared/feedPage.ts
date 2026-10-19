@@ -8,6 +8,9 @@ export interface SplitFeedArgs {
   take: number
   cursorId?: number
   include: any
+  // Following feed: the ids the viewer follows (from loadFollowedIds). The public half is limited to
+  // these authors, and the viewer's own posts are read in full (any status) by the second half.
+  followedIds?: number[]
   // Test seam: called with the chosen ids after the halves are read and before
   // the final read, so tests can change a post's status in between.
   // Test seam: called with the picked ids after the halves are merged and before the final read.
@@ -15,6 +18,26 @@ export interface SplitFeedArgs {
 }
 
 type FeedRef = { id: number; createdAt: Date }
+
+// The following feed is split only for viewers who follow at most this many accounts. For them the follow
+// list is sent as an IN list, so a viewer who follows few accounts reads their posts from the author index.
+// Beyond it the IN list is very large (the reason the follow list was once moved into the query as a
+// relation), and the split was measured no faster, so those viewers keep the single relation query.
+export const MAX_FOLLOWED_IN_LIST = 5000
+
+/** The ids `viewerId` follows, or undefined when there are more than MAX_FOLLOWED_IN_LIST. */
+export async function loadFollowedIds(viewerId: number): Promise<number[] | undefined> {
+  const where = { followerId: viewerId, action: 'FOLLOW' as const, status: 'SUCCESS' as const }
+  // Count first (capped): reading the ids of a viewer over the limit would cost more than it saves.
+  if ((await prisma.follow.count({ where, take: MAX_FOLLOWED_IN_LIST + 1 })) > MAX_FOLLOWED_IN_LIST) return undefined
+  const rows = await prisma.follow.findMany({ where, select: { followingId: true } })
+  return rows.map((r) => r.followingId)
+}
+
+/** Posts by users the viewer follows. Shared by the following feed's halves and its final read. */
+export function followedAuthorCondition(viewerId: number) {
+  return { user: { follows: { some: { followerId: viewerId, action: 'FOLLOW' as const, status: 'SUCCESS' as const } } } }
+}
 
 /**
  * Merges the two halves into one page in feed order (createdAt desc, id desc).
@@ -55,7 +78,7 @@ export async function fetchSplitFeed(args: SplitFeedArgs): Promise<any[]> {
 }
 
 async function fetchBatch(args: SplitFeedArgs, cursorId: number | undefined, take: number) {
-  const { viewerId, extraAnd, include, afterPick } = args
+  const { viewerId, extraAnd, include, afterPick, followedIds } = args
   const none = { rows: [] as any[], exhausted: true, lastId: undefined as number | undefined }
 
   const keyset: any[] = []
@@ -69,14 +92,15 @@ async function fetchBatch(args: SplitFeedArgs, cursorId: number | undefined, tak
   }
 
   const [pub, own] = await Promise.all([
-    prisma.caw.findMany({
-      where: { AND: [{ status: 'SUCCESS' }, ...extraAnd, ...keyset] },
+    // A viewer who follows nobody has no followed posts: skip the query.
+    followedIds && followedIds.length === 0 ? Promise.resolve([] as FeedRef[]) : prisma.caw.findMany({
+      where: { AND: [{ status: 'SUCCESS' }, ...(followedIds ? [{ userId: { in: followedIds } }] : []), ...extraAnd, ...keyset] },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take,
       select: { id: true, createdAt: true },
     }),
     prisma.caw.findMany({
-      where: { AND: [{ status: { in: ['PENDING', 'FAILED'] } }, { userId: viewerId }, ...extraAnd, ...keyset] },
+      where: { AND: [{ status: { in: followedIds ? ['SUCCESS', 'PENDING', 'FAILED'] : ['PENDING', 'FAILED'] } }, { userId: viewerId }, ...extraAnd, ...keyset] },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take,
       select: { id: true, createdAt: true },
@@ -97,6 +121,7 @@ async function fetchBatch(args: SplitFeedArgs, cursorId: number | undefined, tak
       AND: [
         { id: { in: picked.map((r) => r.id) } },
         { OR: [{ status: 'SUCCESS' }, { status: { in: ['PENDING', 'FAILED'] }, userId: viewerId }] },
+        ...(followedIds ? [{ OR: [{ userId: viewerId }, followedAuthorCondition(viewerId)] }] : []),
         ...extraAnd,
       ],
     },
