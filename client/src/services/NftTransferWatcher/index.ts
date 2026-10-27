@@ -224,12 +224,17 @@ export const nftTransferWatcherService: Service = {
     // tokenId if a poke burst arrives before the first call completes.
     const indexingInFlight = new Set<number>()
 
-    subscriber.subscribe('caw:index-token', (err) => {
-      if (err) {
-        console.warn('[NftTransferWatcher] Failed to subscribe to caw:index-token:', err.message)
-        return
-      }
-      console.log('[NftTransferWatcher] Listening on caw:index-token for reactive pokes')
+    // createSafeRedis disables the offline queue, so a command sent before the
+    // connection is ready is rejected instead of queued. Subscribe once the
+    // connection is ready; ioredis re-subscribes by itself after a reconnect.
+    subscriber.once('ready', () => {
+      subscriber.subscribe('caw:index-token', (err) => {
+        if (err) {
+          console.warn('[NftTransferWatcher] Failed to subscribe to caw:index-token:', err.message)
+          return
+        }
+        console.log('[NftTransferWatcher] Listening on caw:index-token for reactive pokes')
+      })
     })
 
     subscriber.on('message', (_channel: string, message: string) => {
