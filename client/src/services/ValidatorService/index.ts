@@ -15,6 +15,7 @@ import { tryClaimChallengeLock, releaseChallengeLock } from '../../utils/challen
 import { withWalletLock } from '../../utils/walletQueue'
 import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
+import { walkLogsBackward, WalkLimitError } from '../../utils/walkLogsBackward'
 import { decompressActionText } from '../../utils/decompressActionText'
 import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
 import { getIndexerStats } from '../../utils/indexerHealth'
@@ -4547,52 +4548,78 @@ console.log("succeededKeys", succeededKeys)
         ? new Contract(CAW_ACTIONS_ERC1271_ADDRESS, cawActionsAbi as any, httpProvider)
         : null
 
-      // Same knob as RawEventsGatherer: operators on a capped RPC set
-      // L2_LOG_CHUNK_BLOCKS to its eth_getLogs range limit. This scan used a
-      // hard-coded 50,000-block window, so on such an RPC every
-      // reconstruction threw and replication never submitted. Unset or
-      // invalid keeps the previous 50,000, so nodes that don't set it see no
-      // change. A failed window still throws and aborts the cycle: skipping
-      // a range would build the submission from incomplete data.
+      // Same knob as RawEventsGatherer: L2_LOG_CHUNK_BLOCKS is the first window
+      // to try. This scan used a hard-coded 50,000-block window, so on an RPC
+      // that caps eth_getLogs below that every reconstruction threw and
+      // replication never submitted. Unset or invalid keeps 50,000. RPC caps
+      // differ and move, so a window the RPC rejects as too wide is retried on
+      // the same range with a smaller one (see walkLogsBackward) instead of
+      // requiring the operator to track the cap. Any other failure still
+      // throws and aborts the cycle: skipping a range would build the
+      // submission from incomplete data.
       const envChunk = Number(process.env.L2_LOG_CHUNK_BLOCKS)
-      const CHUNK = Number.isInteger(envChunk) && envChunk > 0 ? envChunk : 50_000
+      const startChunk = Number.isInteger(envChunk) && envChunk > 0 ? envChunk : 50_000
+      // How far back to look for the actions this submission needs. They
+      // start at the first checkpoint nobody has submitted, so on a quiet
+      // network 32 actions can take weeks to accumulate; without a limit a
+      // scan that never finds enough would walk to block 0, which is a
+      // million calls at a 200-block window. 20,000,000 blocks is about 46
+      // days at 0.2 s per block (Base Sepolia since 2026-10-21).
+      const envMaxBlocks = Number(process.env.L2_LOG_SCAN_MAX_BLOCKS)
+      const maxScanBlocks = Number.isInteger(envMaxBlocks) && envMaxBlocks > 0 ? envMaxBlocks : 20_000_000
       // processedEvents items carry .address so the decode dispatch can branch on
       // which contract emitted the event (ECDSA vs ERC-1271 calldata shape).
       let processedEvents: any[] = []
       let scannedActions = 0
-      let toBlock = latestL2
 
-      while (scannedActions < actionsNeededFromEnd) {
-        const fromBlock = Math.max(0, toBlock - CHUNK + 1)
-        // Filter on the indexed networkId topic so we only get this client's
-        // batches back — much cheaper than the old "decode every event's
-        // bytes to count" approach.
-        const batch = await eventsContract.queryFilter(
-          eventsContract.filters.ActionsProcessed(networkId),
-          fromBlock,
-          toBlock,
-        )
-        let batchERC1271: any[] = []
-        if (eventsContractERC1271) {
-          batchERC1271 = await eventsContractERC1271.queryFilter(
-            eventsContractERC1271.filters.ActionsProcessed(networkId),
-            fromBlock,
-            toBlock,
-          )
-        }
-        // Merge the two event streams for counting. The address field on each
-        // event record identifies which contract emitted it.
-        const combined = [...batch, ...batchERC1271]
-        for (const ev of combined) {
-          const args: any = (ev as any).args
-          if (!args) continue
-          // The new event carries actionCount directly; no payload decode needed.
-          const cnt = Number(args.actionCount ?? args[2] ?? 0)
-          scannedActions += cnt
-        }
-        processedEvents = [...combined, ...processedEvents]
-        if (fromBlock === 0) break
-        toBlock = fromBlock - 1
+      if (actionsNeededFromEnd > 0) {
+        const walked = await walkLogsBackward<any>({
+          latest: latestL2,
+          chunk: startChunk,
+          maxBlocks: maxScanBlocks,
+          fetchWindow: async (fromBlock, toBlock) => {
+            // Filter on the indexed networkId topic so we only get this client's
+            // batches back — much cheaper than the old "decode every event's
+            // bytes to count" approach.
+            const batch = await eventsContract.queryFilter(
+              eventsContract.filters.ActionsProcessed(networkId),
+              fromBlock,
+              toBlock,
+            )
+            let batchERC1271: any[] = []
+            if (eventsContractERC1271) {
+              batchERC1271 = await eventsContractERC1271.queryFilter(
+                eventsContractERC1271.filters.ActionsProcessed(networkId),
+                fromBlock,
+                toBlock,
+              )
+            }
+            // Merge the two event streams for counting. The address field on each
+            // event record identifies which contract emitted it.
+            return [...batch, ...batchERC1271]
+          },
+          onWindow: combined => {
+            for (const ev of combined) {
+              const args: any = (ev as any).args
+              if (!args) continue
+              // The new event carries actionCount directly; no payload decode needed.
+              const cnt = Number(args.actionCount ?? args[2] ?? 0)
+              scannedActions += cnt
+            }
+            return scannedActions >= actionsNeededFromEnd
+          },
+          onShrink: (rejected, next) =>
+            console.log(`[OptimisticReplication] eth_getLogs rejected a ${rejected}-block window; retrying the same range with ${next} blocks`),
+        }).catch(err => {
+          if (err instanceof WalkLimitError) {
+            throw new Error(
+              `found ${scannedActions} of the ${actionsNeededFromEnd} actions needed within the last ${err.covered} blocks; ` +
+              `raise L2_LOG_SCAN_MAX_BLOCKS (now ${maxScanBlocks}) if the network is that quiet`,
+            )
+          }
+          throw err
+        })
+        processedEvents = walked.events
       }
 
       if (processedEvents.length === 0) return null
