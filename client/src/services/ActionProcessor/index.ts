@@ -1,5 +1,5 @@
 //src/services/ActionProcessor/index.ts
-import { createSafeRedis } from '../../lib/redisClient'
+import { closeRedis, createSafeRedis } from '../../lib/redisClient'
 import { ActionType as PrismaActionType } from '@prisma/client'
 import { prisma } from '../../prismaClient'
 import { Service } from '../../Service'
@@ -173,6 +173,7 @@ export const actionProcessorService: Service = {
       started,
       async stop() {
         stopRequested = true
+        await closeRedis(redis)
         clearInterval(idleHeartbeat)
         await prisma.$disconnect()
       },

@@ -24,7 +24,7 @@
 // DepositWatcher in the L1 watcher family; L2 is an independent poll loop.
 
 import 'dotenv/config'
-import { createSafeRedis } from '../../lib/redisClient'
+import { closeRedis, createSafeRedis } from '../../lib/redisClient'
 import { z } from 'zod'
 import { ethers } from 'ethers'
 import Redis from 'ioredis'
@@ -396,7 +396,7 @@ export const sponsorRepayIndexerService: Service = {
         isAlive = false
         l1Loop?.stop()
         l2Loop?.stop()
-        await redis.quit()
+        await closeRedis(redis)
         await prisma.$disconnect()
       },
       stats: async () => {

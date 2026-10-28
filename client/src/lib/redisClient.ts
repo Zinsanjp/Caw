@@ -23,4 +23,14 @@ export function createSafeRedis(customUrl?: string): Redis {
   return client
 }
 
+// With the offline queue disabled, quit() on a client that is not ready is rejected and
+// leaves the connection open and reconnecting, so fall back to disconnect().
+export async function closeRedis(client: Redis): Promise<void> {
+  try {
+    await client.quit()
+  } catch {
+    client.disconnect()
+  }
+}
+
 export const redis = createSafeRedis()
