@@ -20,7 +20,7 @@
 // mental model.
 
 import 'dotenv/config'
-import { closeRedis, createSafeRedis } from '../../lib/redisClient'
+import { closeRedis, createSafeRedis, whenReady } from '../../lib/redisClient'
 import { z } from 'zod'
 import { ethers } from 'ethers'
 import Redis from 'ioredis'
@@ -106,6 +106,7 @@ export const depositWatcherService: Service = {
 
       const cpKey = checkpointKey(cfg.chainId, contractAddress)
       let lastBlock: number
+      await whenReady(redis)
       const cp = await redis.get(cpKey)
       if (cp) {
         lastBlock = parseInt(cp, 10)

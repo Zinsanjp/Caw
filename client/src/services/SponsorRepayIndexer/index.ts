@@ -24,7 +24,7 @@
 // DepositWatcher in the L1 watcher family; L2 is an independent poll loop.
 
 import 'dotenv/config'
-import { closeRedis, createSafeRedis } from '../../lib/redisClient'
+import { closeRedis, createSafeRedis, whenReady } from '../../lib/redisClient'
 import { z } from 'zod'
 import { ethers } from 'ethers'
 import Redis from 'ioredis'
@@ -80,6 +80,7 @@ const cpKey = (chain: string, contract: string) =>
   `sponsor-repay-indexer:${chain}:${contract.toLowerCase()}:last-block`
 
 async function loadCheckpoint(redis: Redis, key: string, fallback: number): Promise<number> {
+  await whenReady(redis)
   const stored = await redis.get(key)
   if (stored) return parseInt(stored, 10)
   return fallback

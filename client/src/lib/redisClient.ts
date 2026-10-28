@@ -33,4 +33,21 @@ export async function closeRedis(client: Redis): Promise<void> {
   }
 }
 
+// With the offline queue disabled, a command sent before the connection is ready is
+// rejected, so wait for it before the first command of a startup path.
+export function whenReady(client: Redis, timeoutMs = 5000): Promise<void> {
+  if (client.status === 'ready') return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const onReady = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      client.off('ready', onReady)
+      reject(new Error(`Redis not ready after ${timeoutMs}ms`))
+    }, timeoutMs)
+    client.once('ready', onReady)
+  })
+}
+
 export const redis = createSafeRedis()

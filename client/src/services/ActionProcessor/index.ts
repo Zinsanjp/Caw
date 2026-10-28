@@ -1,5 +1,5 @@
 //src/services/ActionProcessor/index.ts
-import { closeRedis, createSafeRedis } from '../../lib/redisClient'
+import { closeRedis, createSafeRedis, whenReady } from '../../lib/redisClient'
 import { ActionType as PrismaActionType } from '@prisma/client'
 import { prisma } from '../../prismaClient'
 import { Service } from '../../Service'
@@ -108,6 +108,7 @@ export const actionProcessorService: Service = {
       }
 
       // now subscribe to the same "raws" channel your Gatherer is publishing
+      await whenReady(redis)
       await redis.subscribe('raws')
 
       // Serialize live event processing. ioredis fires the 'message' handler
