@@ -4828,6 +4828,7 @@ console.log("succeededKeys", succeededKeys)
     // ticks every replicationInterval (60s default) but finalization only
     // needs to run hourly — see the gate inside the loop body.
     let lastFinalizeRunAt = 0
+    const FINALIZE_INTERVAL_MS = 60 * 60_000
 
     // Concurrency guard for autoFinalizeSubmissions. The current call site
     // awaits this function inline in the replication loop, so overlapping
@@ -4975,7 +4976,12 @@ console.log("succeededKeys", succeededKeys)
           // on this path too. It used to be reached only at the end of the
           // loop, after this early return, so once pendingCount hit the cap
           // nothing ever finalized and replication stayed halted for good.
-          await autoFinalizeSubmissions()
+          // Same hourly gate as the end of the loop: pendingCount stays at the
+          // cap for the whole challenge period, so every tick takes this path.
+          if (Date.now() - lastFinalizeRunAt > FINALIZE_INTERVAL_MS) {
+            await autoFinalizeSubmissions()
+            lastFinalizeRunAt = Date.now()
+          }
           return
         }
 
@@ -5182,7 +5188,6 @@ console.log("succeededKeys", succeededKeys)
         // reason to scan every replicationInterval (60s default) when the
         // challenge window is days. Hourly hits the right tradeoff between
         // "stake released promptly" and "don't burn RPC for empty scans."
-        const FINALIZE_INTERVAL_MS = 60 * 60_000
         if (Date.now() - lastFinalizeRunAt > FINALIZE_INTERVAL_MS) {
           await autoFinalizeSubmissions()
           lastFinalizeRunAt = Date.now()
