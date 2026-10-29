@@ -1,9 +1,9 @@
 import { Router } from 'express'
 import Redis from 'ioredis'
+import { findReclaimableOffers } from '../util/reclaimableOffers'
 import { prisma } from '../../prismaClient'
 import { requireAuth } from '../middleware/auth'
 import { createNotificationWithGroup } from '../../services/NotificationService'
-import { findReclaimableOffers } from '../util/reclaimableOffers'
 
 const redis = process.env.REDIS_URL
   ? new Redis(process.env.REDIS_URL)
