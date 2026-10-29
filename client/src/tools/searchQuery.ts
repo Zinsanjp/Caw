@@ -7,8 +7,11 @@
 // has any one of those characters, so a Japanese or Chinese query returns
 // mostly unrelated results, and a phrase nobody has posted still returns a full
 // page. The tokens of such a phrase are consecutive in the index, so a
-// match_phrase on them is an exact substring search; that is what is used when
-// the query contains such characters.
+// match_phrase requires them to occur in sequence instead of matching any one
+// character; that is what is used when the query contains such characters. The
+// match follows the analyzer's tokenization and normalization (spaces and
+// punctuation are dropped, Latin is lower-cased), so it is not a literal
+// substring match.
 //
 // Queries without them keep the previous multi_match with fuzziness. That
 // includes katakana-only queries (a katakana run stays one token, so it has no
