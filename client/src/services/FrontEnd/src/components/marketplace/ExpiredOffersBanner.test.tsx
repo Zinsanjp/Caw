@@ -22,17 +22,21 @@ let chain: Record<number, { active: boolean; amount: bigint }> = {}
 const mockWrite = vi.fn()
 const mockResetWrite = vi.fn()
 const mockApiFetch = vi.fn()
+let lastReadQuery: Record<string, unknown> | undefined
 
 vi.mock('wagmi', () => ({
   useAccount: () => ({ address: mockAddress }),
-  useReadContracts: ({ contracts }: { contracts: { args: [bigint] }[] }) => ({
-    data: contracts.map(c => {
-      const o = chain[Number(c.args[0])]
-      return o
-        ? { status: 'success', result: ['0xme', 17, '0xtoken', o.amount, 0n, o.active] }
-        : { status: 'failure', error: new Error('no such offer') }
-    }),
-  }),
+  useReadContracts: ({ contracts, query }: { contracts: { args: [bigint] }[]; query?: Record<string, unknown> }) => {
+    lastReadQuery = query
+    return {
+      data: contracts.map(c => {
+        const o = chain[Number(c.args[0])]
+        return o
+          ? { status: 'success', result: ['0xme', 17, '0xtoken', o.amount, 0n, o.active] }
+          : { status: 'failure', error: new Error('no such offer') }
+      }),
+    }
+  },
   useWriteContract: () => ({ writeContract: mockWrite, data: undefined, isPending: false, error: null, reset: mockResetWrite }),
   useWaitForTransactionReceipt: () => ({ isSuccess: mockMined, isLoading: mockWaiting, data: mockMined ? { status: mockReceiptStatus } : undefined }),
 }))
@@ -70,6 +74,16 @@ describe('ExpiredOffersBanner', () => {
     await userEvent.setup().click(screen.getByText(/still holds your funds/))
     expect(screen.getByText('@alice')).toBeTruthy()
     expect(screen.queryByText('@bob')).toBeNull()
+  })
+
+  it('reads the chain afresh on every mount, not from the app\'s 5-minute cache', async () => {
+    chain = { 1: { active: true, amount: 10n * CAW } }
+    mockApiFetch.mockResolvedValue({ offers: [offer(1, 'alice')] })
+    await renderBanner()
+    // staleTime 0 and gcTime 0: an offer cancelled a moment ago must not come back
+    // from the cache as "active" after leaving the page and returning.
+    expect(lastReadQuery?.staleTime).toBe(0)
+    expect(lastReadQuery?.gcTime).toBe(0)
   })
 
   it('adds up the escrowed amounts of several offers', async () => {

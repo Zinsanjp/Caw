@@ -104,9 +104,13 @@ export const ExpiredOffersBanner: React.FC = () => {
     chainId: chains.l1.chainId,
   })), [candidates])
 
+  // Read afresh each time the banner mounts. The app's query defaults (stale
+  // for 5 minutes, no refetch on mount) would serve the cached "active" for an
+  // offer cancelled a moment ago, and it would reappear with a Reclaim button
+  // after leaving the page and coming back.
   const { data: readData } = useReadContracts({
     contracts: contractReads,
-    query: { enabled: contractReads.length > 0 },
+    query: { enabled: contractReads.length > 0, staleTime: 0, gcTime: 0 },
   })
 
   // Keep the offers that are still active on chain, with the escrowed amount.
