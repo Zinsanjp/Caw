@@ -21,10 +21,13 @@
 
 export type SearchKind = 'all' | 'users' | 'caws' | 'hashtags'
 
-// Characters the standard analyzer indexes one per token: hiragana
-// (U+3040-309F), CJK ideographs (U+3400-9FFF, U+F900-FAFF, and the
-// supplementary planes U+20000-2FA1F).
-const SINGLE_CHAR_TOKEN_REGEX = /[\u3040-\u309f\u3400-\u9fff\uf900-\ufaff\u{20000}-\u{2fa1f}]/u
+// Characters the standard analyzer indexes one per token (checked with its
+// _analyze output): hiragana (U+3040-309F), the ideographic zero 〇 (U+3007),
+// and CJK ideographs: extension A (U+3400-4DBF), unified (U+4E00-9FFF),
+// compatibility (U+F900-FAFF) and the supplementary planes (U+20000-2FA1F).
+// U+4DC0-4DFF, the Yijing hexagram symbols between extension A and the unified
+// block, are not ideographs and the analyzer drops them, so they are left out.
+const SINGLE_CHAR_TOKEN_REGEX = /[\u3007\u3040-\u309f\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u{20000}-\u{2fa1f}]/u
 
 export function hasSingleCharTokens(text: string): boolean {
   return SINGLE_CHAR_TOKEN_REGEX.test(text)

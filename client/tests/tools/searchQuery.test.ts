@@ -13,6 +13,25 @@ describe('hasSingleCharTokens', () => {
     }
   })
 
+  it('is true for ideographs outside the BMP on their own (two UTF-16 units each)', () => {
+    for (const q of ['𠮷', '𠮷𠮷', '\u{20000}', '\u{2fa1f}']) {
+      expect(hasSingleCharTokens(q), q).to.equal(true)
+    }
+  })
+
+  it('is true for the ideographic zero, which the analyzer also splits per character', () => {
+    for (const q of ['〇', '〇〇', '一〇〇']) expect(hasSingleCharTokens(q), q).to.equal(true)
+  })
+
+  it('covers the first and last code point of each range and not the ones just outside', () => {
+    const inside = ['\u3007', '\u3040', '\u309f', '\u3400', '\u4dbf', '\u4e00', '\u9fff', '\uf900', '\ufaff', '\u{20000}', '\u{2fa1f}']
+    // U+3008 (a bracket), U+303F, U+30A0 (just above hiragana), U+33FF, U+4DC0 and U+4DFF (the Yijing
+    // hexagram symbols, which the analyzer drops), U+A000, U+FB00, U+1FFFF, U+2FA20
+    const outside = ['\u3008', '\u303f', '\u30a0', '\u33ff', '\u4dc0', '\u4dff', '\ua000', '\ufb00', '\u{1ffff}', '\u{2fa20}']
+    for (const q of inside) expect(hasSingleCharTokens(q), q.codePointAt(0)!.toString(16)).to.equal(true)
+    for (const q of outside) expect(hasSingleCharTokens(q), q.codePointAt(0)!.toString(16)).to.equal(false)
+  })
+
   it('is false for katakana-only, Latin, Hangul, Thai, digits, symbols and the empty string', () => {
     for (const q of ['チャンク', 'チャンクテスト', 'hello world', 'CAW', '#caw', '한국어로 검색', 'ภาษาไทย', '12345', '!?', '', 'ÅÄÖ', 'Привет']) {
       expect(hasSingleCharTokens(q), q).to.equal(false)
@@ -105,6 +124,11 @@ describe('buildSearchQuery with hiragana or ideographs', () => {
     expect(buildSearchQuery(q, 'hashtags')).to.deep.equal({
       multi_match: { query: q, fields: ['hashtags'], type: 'best_fields', fuzziness: 'AUTO' }
     })
+  })
+
+  it('a query of ideographs outside the BMP is a phrase query, hexagram symbols alone are not', () => {
+    expect(buildSearchQuery('𠮷𠮷', 'caws').bool.should[0]).to.deep.equal({ match_phrase: { content: { query: '𠮷𠮷', boost: 2 } } })
+    expect(buildSearchQuery('\u4dc0\u4dc1', 'caws')).to.have.property('multi_match')
   })
 
   it('a mixed Latin and Japanese query is a phrase query too', () => {
