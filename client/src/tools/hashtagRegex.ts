@@ -35,6 +35,15 @@ export const MENTION_REGEX = new RegExp(`${MENTION_SIGIL_CLASS}(${TAG_CHAR_CLASS
 const URL_REGEX_SOURCE = 'https?:\\/\\/[^\\s<>"\'{}|\\\\^`\\[\\]]+[^\\s<>"\'{}|\\\\^`\\[\\].,!?;:)\\]]';
 
 /**
+ * `content` with every URL replaced by a space, for readers that look only for
+ * `@name` mentions: the `@handle` in https://www.youtube.com/@name or
+ * https://medium.com/@name is part of a link, not a mention, as on screen.
+ */
+export function stripUrls(content: string): string {
+  return content.replace(new RegExp(URL_REGEX_SOURCE, 'gu'), ' ');
+}
+
+/**
  * Mentions, URLs and tags in one left-to-right pass, as the renderer does it:
  * a URL is one piece (its `#fragment` is not a tag on screen), a mention is
  * taken first wherever it starts (so `@https://x.com/a#b` is the mention

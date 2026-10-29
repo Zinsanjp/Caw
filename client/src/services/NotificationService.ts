@@ -1,4 +1,5 @@
 import { prisma } from '../prismaClient'
+import { stripUrls } from '../tools/hashtagRegex'
 import { NotificationType, Prisma } from '@prisma/client'
 import { elasticsearchService } from './ElasticsearchService'
 
@@ -206,7 +207,10 @@ export class NotificationService {
     const mentions: string[] = []
     let match
 
-    while ((match = mentionRegex.exec(content)) !== null) {
+    // Not inside a link: https://www.youtube.com/@name is a URL, not a mention
+    // of the user "name" (the feed and the composer don't render it as one).
+    const text = stripUrls(content)
+    while ((match = mentionRegex.exec(text)) !== null) {
       mentions.push(match[1])
     }
 
