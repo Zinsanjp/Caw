@@ -16,6 +16,7 @@ import { withWalletLock } from '../../utils/walletQueue'
 import { foldCheckpointHashes } from '../../utils/foldCheckpointHashes'
 import { scanLogsForward, scanLogsBackward } from '../../utils/chunkedLogs'
 import { walkLogsBackward, WalkLimitError } from '../../utils/walkLogsBackward'
+import { ScanBackoff } from '../../utils/scanBackoff'
 import { decompressActionText } from '../../utils/decompressActionText'
 import { makeJsonRpcProvider, makeFallbackJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl, getL2HttpRpcUrls, getL2WsRpcUrl, getL2WsSecret, getEthMainnetHttpRpcUrl, getReplicationHttpRpcUrl, redactRpcUrl } from '../../utils/rpcProvider'
 import { getIndexerStats } from '../../utils/indexerHealth'
@@ -4509,6 +4510,18 @@ console.log("succeededKeys", succeededKeys)
       return { l2bProvider, l2bSubmitter, l2bMonitor, archiveRead, archiveWrite }
     }
 
+    // A reconstruction that walked its whole lookback without finding the
+    // actions it needs is not repeated on the next tick (replicationInterval,
+    // 120 s): on an RPC that caps the window at 200 blocks it is 200,000
+    // eth_getLogs calls, on the RPC the indexers use. Held per network for an
+    // hour, like the finalize pass, or until L2_LOG_SCAN_MAX_BLOCKS changes.
+    const SCAN_LIMIT_HOLD_MS = 60 * 60_000
+    const scanLimitBackoff = new ScanBackoff(SCAN_LIMIT_HOLD_MS)
+    // The window the last walk ended on. A window the RPC rejected is still
+    // rejected on the next reconstruction, so start from it instead of paying
+    // one rejected call to find out again.
+    let rememberedChunk: number | undefined
+
     /**
      * Shared helper: reconstruct ordered actions + r values from L2 events
      * for a given network and checkpoint range. Reuses the exact same logic as
@@ -4567,6 +4580,13 @@ console.log("succeededKeys", succeededKeys)
       // days at 0.2 s per block (Base Sepolia since 2026-10-21).
       const envMaxBlocks = Number(process.env.L2_LOG_SCAN_MAX_BLOCKS)
       const maxScanBlocks = Number.isInteger(envMaxBlocks) && envMaxBlocks > 0 ? envMaxBlocks : 20_000_000
+      const heldMs = scanLimitBackoff.remaining(String(networkId), maxScanBlocks)
+      if (heldMs > 0) {
+        throw new Error(
+          `skipped: the last scan reached its ${maxScanBlocks}-block limit without finding the actions needed; ` +
+          `trying again in ${Math.ceil(heldMs / 60_000)} min, or sooner if L2_LOG_SCAN_MAX_BLOCKS is raised`,
+        )
+      }
       // processedEvents items carry .address so the decode dispatch can branch on
       // which contract emitted the event (ECDSA vs ERC-1271 calldata shape).
       let processedEvents: any[] = []
@@ -4575,7 +4595,7 @@ console.log("succeededKeys", succeededKeys)
       if (actionsNeededFromEnd > 0) {
         const walked = await walkLogsBackward<any>({
           latest: latestL2,
-          chunk: startChunk,
+          chunk: rememberedChunk ?? startChunk,
           maxBlocks: maxScanBlocks,
           fetchWindow: async (fromBlock, toBlock) => {
             // Filter on the indexed networkId topic so we only get this client's
@@ -4612,6 +4632,7 @@ console.log("succeededKeys", succeededKeys)
             console.log(`[OptimisticReplication] eth_getLogs rejected a ${rejected}-block window; retrying the same range with ${next} blocks`),
         }).catch(err => {
           if (err instanceof WalkLimitError) {
+            scanLimitBackoff.record(String(networkId), maxScanBlocks)
             throw new Error(
               `found ${scannedActions} of the ${actionsNeededFromEnd} actions needed within the last ${err.covered} blocks; ` +
               `raise L2_LOG_SCAN_MAX_BLOCKS (now ${maxScanBlocks}) if the network is that quiet`,
@@ -4620,6 +4641,8 @@ console.log("succeededKeys", succeededKeys)
           throw err
         })
         processedEvents = walked.events
+        rememberedChunk = walked.chunk
+        scanLimitBackoff.clear(String(networkId))
       }
 
       if (processedEvents.length === 0) return null
