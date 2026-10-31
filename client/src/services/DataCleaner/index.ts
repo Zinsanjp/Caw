@@ -307,7 +307,7 @@ async function cleanupPendingTips() {
  * - If the reply caw is SUCCESS, mark reply as not pending
  * - If the reply caw is FAILED or missing after 30 minutes, delete the reply
  */
-async function cleanupPendingReplies() {
+export async function cleanupPendingReplies() {
   logger.log('Cleaning up stale pending replies...')
 
   try {
@@ -347,11 +347,11 @@ async function cleanupPendingReplies() {
           })
 
           // Recalculate comment count on the parent caw
+          // Every Reply row counts, pending ones too: onReplyCreated adds the
+          // +1 when the pending row is created and confirming adds nothing
+          // (same rule as scripts/reconcile-caw-counts.ts).
           const actualReplyCount = await prisma.reply.count({
-            where: {
-              cawId: pendingReply.cawId,
-              pending: false
-            }
+            where: { cawId: pendingReply.cawId }
           })
 
           await prisma.caw.update({
@@ -396,11 +396,11 @@ async function cleanupPendingReplies() {
             where: { id: pendingReply.id }
           })
 
+          // Every Reply row counts, pending ones too: onReplyCreated adds the
+          // +1 when the pending row is created and confirming adds nothing
+          // (same rule as scripts/reconcile-caw-counts.ts).
           const actualReplyCount = await prisma.reply.count({
-            where: {
-              cawId: pendingReply.cawId,
-              pending: false
-            }
+            where: { cawId: pendingReply.cawId }
           })
 
           await prisma.caw.update({
@@ -429,7 +429,7 @@ async function cleanupPendingReplies() {
  * - If action exists, mark as SUCCESS
  * - If action doesn't exist and it's been > 30 minutes, mark as FAILED
  */
-async function cleanupPendingCaws() {
+export async function cleanupPendingCaws() {
   logger.log('Cleaning up stale pending caws...')
 
   try {
@@ -542,8 +542,9 @@ async function cleanupPendingCaws() {
             if (replyRecord) {
               await prisma.reply.delete({ where: { id: replyRecord.id } })
 
+              // Pending Reply rows count too (see cleanupPendingReplies).
               const actualReplyCount = await prisma.reply.count({
-                where: { cawId: replyRecord.cawId, pending: false }
+                where: { cawId: replyRecord.cawId }
               })
               await prisma.caw.update({
                 where: { id: replyRecord.cawId },
