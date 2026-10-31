@@ -27,7 +27,7 @@ function decompressActionText(textField: unknown): string {
 // backfill so the user doesn't wait for the next poll cycle.
 import { pokeIndexTokenId } from '../util/indexerPoke'
 import { countManager } from '../../services/CountManager'
-import { deleteFailedCaws } from '../shared/failedCaw'
+import { deleteReplacedFailedCaws } from '../shared/failedCaw'
 import { parsePoll, parseVoteText } from '../../tools/pollMarker'
 import { getSession, addAuthorization, createSession } from '../sessionStore'
 import { SESSION_COOKIE_NAME, sessionCookieOptions } from '../middleware/auth'
@@ -1153,12 +1153,12 @@ router.post('/', async (req, res) => {
         // retrying a reply under Parent X does not remove failed replies under
         // Parent Y with identical text (nor standalone posts with originalCawId=null).
         if (textContent) {
-          const deleted = await deleteFailedCaws(prisma, {
+          const deleted = await deleteReplacedFailedCaws(prisma, {
             userId: data.senderId,
             content: textContent,
-            action: isRecaw ? 'RECAW' : 'CAW',
-            originalCawId: originalCawId || null,
-            id: { not: caw.id }
+            isRecaw,
+            originalCawId,
+            excludeCawId: caw.id,
           })
           if (deleted > 0) {
             console.log(`Cleaned up ${deleted} old failed caw(s) replaced by retry`)

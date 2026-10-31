@@ -4,6 +4,38 @@ import { countManager } from '../../services/CountManager'
 class NoLongerFailed extends Error {}
 
 /**
+ * Which FAILED caws a new submission replaces: the same sender's, with the same
+ * content, the same action type (reply/post vs. quote) and the same parent
+ * (`originalCawId`; null for a standalone post), except the new caw itself.
+ * The parent and the action type matter: matching on sender and content alone
+ * also removes the sender's failed replies to other posts with identical text,
+ * and gives back those posts' commentCount.
+ */
+export function replacedFailedCawsWhere(p: {
+  userId: number
+  content: string
+  isRecaw: boolean
+  originalCawId?: number | null
+  excludeCawId: number
+}): Prisma.CawWhereInput {
+  return {
+    userId: p.userId,
+    content: p.content,
+    action: p.isRecaw ? 'RECAW' : 'CAW',
+    originalCawId: p.originalCawId || null,
+    id: { not: p.excludeCawId },
+  }
+}
+
+/** Delete the FAILED caws that a new submission replaces (retry cleanup). */
+export function deleteReplacedFailedCaws(
+  prisma: PrismaClient,
+  p: Parameters<typeof replacedFailedCawsWhere>[0]
+): Promise<number> {
+  return deleteFailedCaws(prisma, replacedFailedCawsWhere(p))
+}
+
+/**
  * Delete the FAILED caws matching `where`, returning how many were deleted.
  *
  * A failed reply still has its pending Reply row (markTxQueueFailed marks the
