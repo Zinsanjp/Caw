@@ -133,7 +133,7 @@ describe('failed profile update releases profileUpdatePending', function () {
     })
 
     it('leaves the flag when the sender has another profile update in flight', async () => {
-      for (const status of ['pending', 'processing', 'awaiting_indexer', 'waiting_for_deposit', 'underpriced']) {
+      for (const status of ['pending', 'processing', 'awaiting_indexer', 'waiting_for_deposit', 'waiting_for_session', 'underpriced']) {
         await prisma.txQueue.deleteMany({ where: { senderId: SENDER } })
         await setFlag(true)
         await addTx({ status, text: hex(PROFILE_TEXT) })
@@ -141,6 +141,22 @@ describe('failed profile update releases profileUpdatePending', function () {
         await fail(failing)
         expect(await flag(), `sibling status ${status}`).to.equal(true)
       }
+    })
+
+    it('leaves the flag when in-flight sibling has actionType "other"', async () => {
+      await setFlag(true)
+      await addTx({ status: 'pending', text: hex(PROFILE_TEXT), actionType: 'other' })
+      const failing = await addTx({ status: 'processing', text: hex(PROFILE_TEXT) })
+      await fail(failing)
+      expect(await flag()).to.equal(true)
+    })
+
+    it('leaves the flag when in-flight sibling is stored as plain text', async () => {
+      await setFlag(true)
+      await addTx({ status: 'pending', text: PROFILE_TEXT, actionType: 7 })
+      const failing = await addTx({ status: 'processing', text: hex(PROFILE_TEXT) })
+      await fail(failing)
+      expect(await flag()).to.equal(true)
     })
 
     it('ignores siblings that can no longer land, other senders, and other action kinds', async () => {

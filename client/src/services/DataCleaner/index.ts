@@ -2,7 +2,7 @@ import { prisma } from '../../prismaClient'
 import { ethers, JsonRpcProvider, WebSocketProvider, Contract } from 'ethers'
 import { makeJsonRpcProvider, makeWebSocketProvider, getL2HttpRpcUrl } from '../../utils/rpcProvider'
 import { dataCleanerLogger as logger } from '../../utils/dataCleanerLogger'
-import { markTxQueueFailed, isProfileUpdateText, clearProfileUpdatePending } from '../../utils/txQueueFailure'
+import { markTxQueueFailed, isProfileUpdateText, clearProfileUpdatePending, isOtherAction, extractActionText } from '../../utils/txQueueFailure'
 import { decompressActionText } from '../../utils/decompressActionText'
 import { sweep as sweepOrphanedMedia, pendingCount as orphanedMediaPendingCount } from '../../api/util/orphanedMedia'
 import { cleanStaleOgCache } from '../../api/routes/og'
@@ -671,11 +671,10 @@ export async function cleanupFailedTxQueue() {
               action: 'FOLLOW'
             }
           })
-        } else if (data.actionType === 7 || data.actionType === 'other') {
+        } else if (isOtherAction(data)) {
           // The signed `text` is smltxt-compressed hex; the subtype prefix is in
           // the decompressed plaintext. Plain text is kept as a fallback.
-          const text = decompressActionText(data.text) ||
-            (typeof data.text === 'string' && !data.text.startsWith('0x') ? data.text : '')
+          const text = extractActionText(data.text)
 
           if (text.startsWith('tip:')) {
             // Remove the pending tip
