@@ -4,6 +4,43 @@ import { decompressActionText } from './decompressActionText'
 import { createNotificationWithGroup } from '../services/NotificationService'
 import { sanitizeFailureReason } from './sanitizeFailureReason'
 
+// TxQueue statuses a row can still reach the chain from. 'underpriced' is
+// included because those rows are held for another validator to pick up.
+const IN_FLIGHT_TX_STATUSES = ['pending', 'processing', 'awaiting_indexer', 'waiting_for_deposit', 'underpriced']
+
+export function isProfileUpdateText(text: string): boolean {
+  return text.startsWith('p:') || text.startsWith('profile-update:')
+}
+
+/**
+ * Clear User.profileUpdatePending after a profile-update TxQueue row failed.
+ *
+ * /api/actions sets the flag at submit time and only a successful
+ * handleOtherAction clears it, so a failed update would otherwise leave the
+ * profile page on "updating" with the edit button disabled. The flag is per
+ * user, not per cawonce, so it is left alone while another profile update from
+ * the same sender can still land.
+ */
+export async function clearProfileUpdatePending(
+  prisma: PrismaClient,
+  senderId: number
+): Promise<void> {
+  const inFlight = await prisma.txQueue.findMany({
+    where: { senderId, status: { in: IN_FLIGHT_TX_STATUSES } },
+    select: { payload: true },
+  })
+  const anotherInFlight = inFlight.some((row) => {
+    const data = (row.payload as any)?.data
+    return Number(data?.actionType) === 7 && isProfileUpdateText(decompressActionText(data?.text))
+  })
+  if (anotherInFlight) return
+
+  await prisma.user.updateMany({
+    where: { tokenId: senderId, profileUpdatePending: true },
+    data: { profileUpdatePending: false },
+  })
+}
+
 /**
  * THE single choke point for marking a TxQueue row as failed.
  *
@@ -240,6 +277,13 @@ async function cleanupOptimisticRows(
         await prisma.vote.deleteMany({
           where: { voterId: senderId, cawonce, pending: true }
         })
+      }
+
+      // PROFILE UPDATE (p: / profile-update: prefix): /api/actions set
+      // profileUpdatePending at submit time; only a successful handler clears
+      // it, so release it here.
+      if (isProfileUpdateText(text)) {
+        await clearProfileUpdatePending(prisma, senderId)
       }
 
       // PIN / UNPIN (pi: / xpi: prefix). Symmetric rollback:
