@@ -1148,11 +1148,16 @@ router.post('/', async (req, res) => {
           }
         }
 
-        // Clean up old FAILED caws with the same content (retries)
+        // Clean up old FAILED caws with the same content (retries).
+        // Scoped to the same parent (originalCawId) and action type so that
+        // retrying a reply under Parent X does not remove failed replies under
+        // Parent Y with identical text (nor standalone posts with originalCawId=null).
         if (textContent) {
           const deleted = await deleteFailedCaws(prisma, {
             userId: data.senderId,
             content: textContent,
+            action: isRecaw ? 'RECAW' : 'CAW',
+            originalCawId: originalCawId || null,
             id: { not: caw.id }
           })
           if (deleted > 0) {

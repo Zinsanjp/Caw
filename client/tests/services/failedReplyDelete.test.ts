@@ -47,7 +47,7 @@ async function submitReply(parentId: number, opts: { userId?: number; content?: 
   const userId = opts.userId ?? REPLIER
   const cawonce = nextCawonce()
   const reply = await prisma.caw.create({
-    data: { userId, cawonce, content: opts.content ?? 'a reply', status: 'PENDING', action: 'CAW' } as any,
+    data: { userId, cawonce, content: opts.content ?? 'a reply', status: 'PENDING', action: 'CAW', originalCawId: parentId } as any,
   })
   await countManager.onCawCreated(prisma as any, {
     id: reply.id, userId, action: 'CAW', originalCawId: null, status: 'PENDING', isReply: true,
@@ -200,18 +200,78 @@ describe('deleteFailedCaws (dismiss / retry cleanup of a failed caw)', function 
     await validatorFails(old1)
     await validatorFails(old2)
     const other = await prisma.caw.create({
-      data: { userId: OTHER, cawonce: nextCawonce(), content: 'same text', status: 'FAILED', action: 'CAW' } as any,
+      data: { userId: OTHER, cawonce: nextCawonce(), content: 'same text', status: 'FAILED', action: 'CAW', originalCawId: parent.id } as any,
     })
     const retry = await submitReply(parent.id, { content: 'same text' })
     expect(await commentCount(parent.id)).to.equal(3)
 
-    const removed = await deleteFailedCaws(prisma, { userId: REPLIER, content: 'same text', id: { not: retry.reply.id } })
+    const removed = await deleteFailedCaws(prisma, {
+      userId: REPLIER,
+      content: 'same text',
+      action: 'CAW',
+      originalCawId: parent.id,
+      id: { not: retry.reply.id }
+    })
     expect(removed).to.equal(2)
     expect(await prisma.caw.count({ where: { id: { in: [old1.reply.id, old2.reply.id] } } })).to.equal(0)
     expect(await prisma.caw.count({ where: { id: { in: [other.id, retry.reply.id] } } })).to.equal(2)
     // only the retry's own +1 is left
     expect(await commentCount(parent.id)).to.equal(1)
     expect(await prisma.reply.count({ where: { replyCawId: retry.reply.id } })).to.equal(1)
+  })
+
+  it('retry cleanup: does not remove FAILED replies to a different parent (R01-F1)', async () => {
+    const parentX = await makeParent()
+    const parentY = await makeParent()
+    const replyX = await submitReply(parentX.id, { content: 'same text' })
+    const replyY = await submitReply(parentY.id, { content: 'same text' })
+    await validatorFails(replyX)
+    await validatorFails(replyY)
+    expect(await commentCount(parentX.id)).to.equal(1)
+    expect(await commentCount(parentY.id)).to.equal(1)
+
+    // User resubmits to parentX
+    const retryX = await submitReply(parentX.id, { content: 'same text' })
+    expect(await commentCount(parentX.id)).to.equal(2)
+
+    const removed = await deleteFailedCaws(prisma, {
+      userId: REPLIER,
+      content: 'same text',
+      action: 'CAW',
+      originalCawId: parentX.id,
+      id: { not: retryX.reply.id },
+    })
+    expect(removed).to.equal(1)
+    // replyX is removed, parentX count is decremented back to 1 (only retryX's own +1 remains)
+    expect(await prisma.caw.count({ where: { id: replyX.reply.id } })).to.equal(0)
+    expect(await commentCount(parentX.id)).to.equal(1)
+
+    // replyY is NOT removed, parentY count remains intact
+    expect(await prisma.caw.count({ where: { id: replyY.reply.id } })).to.equal(1)
+    expect(await commentCount(parentY.id)).to.equal(1)
+  })
+
+  it('retry cleanup: top-level caw does not remove FAILED replies with same content', async () => {
+    const parent = await makeParent()
+    const reply = await submitReply(parent.id, { content: 'same text' })
+    await validatorFails(reply)
+    expect(await commentCount(parent.id)).to.equal(1)
+
+    // User submits top-level post with same text
+    const topLevel = await prisma.caw.create({
+      data: { userId: REPLIER, cawonce: nextCawonce(), content: 'same text', status: 'PENDING', action: 'CAW', originalCawId: null } as any,
+    })
+
+    const removed = await deleteFailedCaws(prisma, {
+      userId: REPLIER,
+      content: 'same text',
+      action: 'CAW',
+      originalCawId: null,
+      id: { not: topLevel.id },
+    })
+    expect(removed).to.equal(0)
+    expect(await prisma.caw.count({ where: { id: reply.reply.id } })).to.equal(1)
+    expect(await commentCount(parent.id)).to.equal(1)
   })
 
   it('changes nothing when the caw stops being FAILED while it is being deleted', async () => {
